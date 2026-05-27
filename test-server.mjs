@@ -13,6 +13,23 @@ const BASE_URL = 'http://localhost:8090';
 // const BASE_URL = 'http://192.168.87.30:8070'; // KITSU
 const SLOT_IDX = 0;
 
+// Check for --props flag
+const args = process.argv.slice(2);
+const SHOW_PROPS_ONLY = args.includes('--props');
+
+async function getProps() {
+    console.log('\n=== GET /props ===');
+    try {
+        const response = await fetch(`${BASE_URL}/props`);
+        const data = await response.json();
+        console.log(JSON.stringify(data, null, 2));
+        return data;
+    } catch (error) {
+        console.error('Error fetching props:', error.message);
+        return null;
+    }
+}
+
 async function getSlots() {
     console.log('\n=== GET /slots ===');
     try {
@@ -113,6 +130,12 @@ async function sendCompletion(prompt, id_slot = -1) {
 async function main() {
     console.log('Testing llama-server on', BASE_URL);
     console.log('='.repeat(50));
+
+    // If --props flag is set, just show props and exit
+    if (SHOW_PROPS_ONLY) {
+        await getProps();
+        return;
+    }
 
     const BEFORE_FNAME = `slot${SLOT_IDX}-before.state`;
     const AFTER_FNAME = `slot${SLOT_IDX}-after.state`;

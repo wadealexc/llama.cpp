@@ -25,6 +25,8 @@ struct server_context_meta {
     json json_webui_settings;            // Deprecated: use json_ui_settings instead (kept for backward compat)
     int slot_n_ctx;
     enum llama_pooling_type pooling_type;
+    std::string cache_type_k;
+    std::string cache_type_v;
 
     // chat params
     server_chat_params & chat_params;
