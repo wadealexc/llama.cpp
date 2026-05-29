@@ -19,19 +19,25 @@ const AFTER_FNAME = `slot${SLOT_IDX}-after.state`;
 
 const SLOT_SAVE_PATH = './slot-saves/';
 
-// Check for --props flag
+const PROMPT_MSG = "hi how are you";
+const SEND_MSG = "are you okay?";
+
+// Parse command line arguments
 const args = process.argv.slice(2);
 const SHOW_PROPS_ONLY = args.includes('--props');
-const READ_FILE_INFO_ONLY = args.includes('--read');
+const USE_READ = args.includes('--read');
 const PRINT_TENSOR_INFO = args.includes('--tensors');
+
+// Parse flag arguments
+const USE_PROMPT = args.includes('--prompt');
+const USE_SEND = args.includes('--send');
+const USE_RESTORE = args.includes('--restore');
 
 async function getProps() {
     console.log('\n=== GET /props ===');
     try {
         const response = await fetch(`${BASE_URL}/props`);
-        const data = await response.json();
-        console.log(JSON.stringify(data, null, 2));
-        return data;
+        return await response.json();
     } catch (error) {
         console.error('Error fetching props:', error.message);
         return null;
@@ -325,37 +331,117 @@ async function main() {
     console.log('Testing llama-server on', BASE_URL);
     console.log('='.repeat(50));
 
+    console.log(args)
+
     // If --props flag is set, just show props and exit
     if (SHOW_PROPS_ONLY) {
-        await getProps();
+        const props = await getProps();
+        console.log(JSON.stringify(props, null, 2));
         return;
-    } else if (READ_FILE_INFO_ONLY) {
-        readSlotFile(BEFORE_FNAME);
-        readSlotFile(AFTER_FNAME);
+    }
+    
+    // Handle --read
+    if (USE_READ) {
+        console.log(`\n=== Read Mode ===`);
+        
+        // Get the filename from the next argument after --read
+        const readIndex = args.indexOf('--read');
+        if (readIndex === -1 || readIndex === args.length - 1) {
+            console.error('Error: --read requires a filename argument');
+            console.error('Usage: node test-server.mjs --read <filename>');
+            return;
+        }
+        const filenameArg = args[readIndex + 1];
+        
+        console.log(`Reading file: ${filenameArg}`);
+        readSlotFile(filenameArg);
+        
+        console.log('\n' + '='.repeat(50));
+        console.log('Read mode complete!');
         return;
     }
 
-    // Step 1: Get initial slot state
-    await getSlots();
+    // Handle --prompt
+    if (USE_PROMPT) {
+        console.log(`\n=== Prompt Mode ===`);
+        console.log(`Prompt: ${PROMPT_MSG}`);
+        
+        // Step 1: Get props to determine cache types
+        const props = await getProps();
+        const cacheTypeK = props.cache_type_k;
+        const cacheTypeV = props.cache_type_v;
+        const filename = `k_${cacheTypeK}__v_${cacheTypeV}.state`;
+        
+        console.log(`Cache types: K=${cacheTypeK}, V=${cacheTypeV}`);
+        console.log(`Save filename: ${filename}`);
+        
+        // Step 2: Send completion
+        await sendCompletion(PROMPT_MSG, SLOT_IDX);
+        
+        // Step 3: Save slot
+        await saveSlot(SLOT_IDX, filename, 'save');
+        
+        console.log('\n' + '='.repeat(50));
+        console.log('Prompt mode complete!');
+        return;
+    }
+    
+    // Handle --restore
+    if (USE_RESTORE) {
+        console.log(`\n=== Restore Mode ===`);
+        
+        // Get the filename from the next argument after --restore
+        const restoreIndex = args.indexOf('--restore');
+        if (restoreIndex === -1 || restoreIndex === args.length - 1) {
+            console.error('Error: --restore requires a filename argument');
+            console.error('Usage: node test-server.mjs --restore <filename>');
+            return;
+        }
+        const filenameArg = args[restoreIndex + 1];
+        
+        // Ensure filename has .state extension
+        let filename = filenameArg;
+        if (!filename.endsWith('.state')) {
+            filename += '.state';
+        }
+        console.log(`Restoring from: ${filename}`);
+        
+        // Step 1: Restore slot
+        await saveSlot(SLOT_IDX, filename, 'restore');
+        
+        // Step 2: Query and log slots
+        await getSlots();
+        
+        console.log('\n' + '='.repeat(50));
+        console.log('Restore mode complete!');
+        return;
+    }
+    
+    // Handle --send
+    if (USE_SEND) {
+        console.log(`\n=== Send Mode ===`);
+        console.log(`Message: ${SEND_MSG}`);
+        
+        // Just send completion, no props query or save
+        await sendCompletion(SEND_MSG, SLOT_IDX);
+        
+        console.log('\n' + '='.repeat(50));
+        console.log('Send mode complete!');
+        return;
+    }
 
-    // Step 2: Save slot state (before)
-    await saveSlot(SLOT_IDX, BEFORE_FNAME, 'save');
+    console.log(`no flags specified`);
 
-    // Step 3: Send completion request (targeting SLOT_IDX)
-    const prompt = 'hi how are you';
-    await sendCompletion(prompt, SLOT_IDX);
+    // // Default mode: full workflow
+    // console.log(`\n=== Default Mode ===`);
+    
+    // await saveSlot(SLOT_IDX, AFTER_FNAME, 'save');
 
-    // Step 4: Get slot state after completion
-    await getSlots();
-
-    // Step 5: Save slot state (after)
-    await saveSlot(SLOT_IDX, AFTER_FNAME, 'save');
-
-    console.log('\n' + '='.repeat(50));
-    console.log('Test complete!');
-    console.log('\nSaved files:');
-    console.log(`  - ${BEFORE_FNAME} (binary KV cache)`);
-    console.log(`  - ${AFTER_FNAME} (binary KV cache)`);
+    // console.log('\n' + '='.repeat(50));
+    // console.log('Test complete!');
+    // console.log('\nSaved files:');
+    // console.log(`  - ${BEFORE_FNAME} (binary KV cache)`);
+    // console.log(`  - ${AFTER_FNAME} (binary KV cache)`);
 }
 
 main().catch(console.error);
