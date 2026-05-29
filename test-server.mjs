@@ -23,6 +23,7 @@ const SLOT_SAVE_PATH = './slot-saves/';
 const args = process.argv.slice(2);
 const SHOW_PROPS_ONLY = args.includes('--props');
 const READ_FILE_INFO_ONLY = args.includes('--read');
+const PRINT_TENSOR_INFO = args.includes('--tensors');
 
 async function getProps() {
     console.log('\n=== GET /props ===');
@@ -268,6 +269,8 @@ function readSlotFile(file) {
         console.log(` - Value tensor in transposed layout? ${vTrans ? 'yes' : 'no'}`);
         console.log(` - N Layers: ${nLayers}`);
 
+        // Read K rows
+        const kOffsetStart = offset;
         for (let j = 0; j < nLayers; j++) {
             // Read ggml_type
             const keyType = buffer.readInt32LE(offset);
@@ -279,11 +282,42 @@ function readSlotFile(file) {
 
             let keyTypeStr = ggmlTypeToString(keyType);
             if (keyTypeStr === "UNKNOWN") keyTypeStr += `(${keyType})`;
-            console.log(` --- layer ${j} | keyType: ${keyTypeStr} | rowSize: ${keyRowSize}`);
+            
+            // Assume contiguous cells; calculate tensor size and increment offset
+            const tensorSize = BigInt(cellCount) * keyRowSize;
+            offset += Number(tensorSize);
 
-            // Assume contiguous cells; read tensor
-            // const tensor = 
+            if (PRINT_TENSOR_INFO)
+                console.log(` --- layer ${j} | kType: ${keyTypeStr} | rowSize: ${keyRowSize} | tensorSize: ${formatBytes(Number(tensorSize))}`);
         }
+        
+        const kTotalSize = offset - kOffsetStart;
+        console.log(` - Total K tensor size: ${formatBytes(kTotalSize)}`);
+
+        // Read V rows
+        const vOffsetStart = offset;
+        for (let j = 0; j < nLayers; j++) {
+            // Read ggml_type
+            const vType = buffer.readInt32LE(offset);
+            offset += 4;
+
+            // Read row size of value
+            const vRowSize = buffer.readBigUInt64LE(offset);
+            offset += 8;
+
+            let vTypeStr = ggmlTypeToString(vType);
+            if (vTypeStr === "UNKNOWN") vTypeStr += `(${vType})`;
+
+            // Assume contiguous cells; calculate tensor size and increment offset
+            const tensorSize = BigInt(cellCount) * vRowSize;
+            offset += Number(tensorSize);
+
+            if (PRINT_TENSOR_INFO)
+                console.log(` --- layer ${j} | vType: ${vTypeStr} | rowSize: ${vRowSize} | tensorSize: ${formatBytes(Number(tensorSize))}`);
+        }
+
+        const vTotalSize = offset - vOffsetStart;
+        console.log(` - Total V tensor size: ${formatBytes(vTotalSize)}`);
     }
 }
 
