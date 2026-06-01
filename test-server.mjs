@@ -26,12 +26,14 @@ const SEND_MSG = "are you okay?";
 const args = process.argv.slice(2);
 const SHOW_PROPS_ONLY = args.includes('--props');
 const USE_READ = args.includes('--read');
+const USE_DETOKENIZE = args.includes('--readtok');
 const PRINT_TENSOR_INFO = args.includes('--tensors');
 
 // Parse flag arguments
 const USE_PROMPT = args.includes('--prompt');
 const USE_SEND = args.includes('--send');
 const USE_RESTORE = args.includes('--restore');
+const USE_SAVE = args.includes('--save');
 
 async function getProps() {
     console.log('\n=== GET /props ===');
@@ -63,6 +65,13 @@ function formatBytes(bytes) {
     const sizes = ['B', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+function ensureStateExtension(filename) {
+    if (!filename.endsWith('.state')) {
+        filename += '.state';
+    }
+    return filename;
 }
 
 async function saveSlot(id, filename, action = 'save') {
@@ -182,7 +191,7 @@ function ggmlTypeToString(ggmlType) {
     return typeMap[ggmlType] || 'UNKNOWN';
 }
 
-function readSlotFile(file) {
+async function readSlotFile(file, detokenize = false) {
     const path = SLOT_SAVE_PATH + file;
     console.log(`Reading slot file: ${file} at path ${path}`);
 
@@ -325,13 +334,38 @@ function readSlotFile(file) {
         const vTotalSize = offset - vOffsetStart;
         console.log(` - Total V tensor size: ${formatBytes(vTotalSize)}`);
     }
+
+    if (detokenize) {
+        console.log(`\nDetokenizing prompt:`);
+
+        try {
+            const response = await fetch(`${BASE_URL}/detokenize`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    tokens: tokens,
+                }),
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const data = await response.json();
+            console.log(data.content);
+        } catch (error) {
+            console.error('Error detokenizing:', error.message);
+        }
+    }
 }
 
 async function main() {
     console.log('Testing llama-server on', BASE_URL);
     console.log('='.repeat(50));
 
-    console.log(args)
+    console.log(args);
 
     // If --props flag is set, just show props and exit
     if (SHOW_PROPS_ONLY) {
@@ -340,7 +374,7 @@ async function main() {
         return;
     }
     
-    // Handle --read
+    // Handle --read "filename"
     if (USE_READ) {
         console.log(`\n=== Read Mode ===`);
         
@@ -352,9 +386,32 @@ async function main() {
             return;
         }
         const filenameArg = args[readIndex + 1];
+        const filename = ensureStateExtension(filenameArg);
         
-        console.log(`Reading file: ${filenameArg}`);
-        readSlotFile(filenameArg);
+        console.log(`Reading file: ${filename}`);
+        await readSlotFile(filename);
+        
+        console.log('\n' + '='.repeat(50));
+        console.log('Read mode complete!');
+        return;
+    }
+
+    // Handle --readtok "filename"
+    if (USE_DETOKENIZE) {
+        console.log(`\n=== Detokenize Mode ===`);
+        
+        // Get the filename from the next argument after --readtok
+        const readTokIndex = args.indexOf('--readtok');
+        if (readTokIndex === -1 || readTokIndex === args.length - 1) {
+            console.error('Error: --readtok requires a filename argument');
+            console.error('Usage: node test-server.mjs --readtok <filename>');
+            return;
+        }
+        const filenameArg = args[readTokIndex + 1];
+        const filename = ensureStateExtension(filenameArg);
+        
+        console.log(`Reading file and detokenizing prompt: ${filename}`);
+        await readSlotFile(filename, true);
         
         console.log('\n' + '='.repeat(50));
         console.log('Read mode complete!');
@@ -386,7 +443,7 @@ async function main() {
         return;
     }
     
-    // Handle --restore
+    // Handle --restore "filename"
     if (USE_RESTORE) {
         console.log(`\n=== Restore Mode ===`);
         
@@ -398,12 +455,7 @@ async function main() {
             return;
         }
         const filenameArg = args[restoreIndex + 1];
-        
-        // Ensure filename has .state extension
-        let filename = filenameArg;
-        if (!filename.endsWith('.state')) {
-            filename += '.state';
-        }
+        const filename = ensureStateExtension(filenameArg);
         console.log(`Restoring from: ${filename}`);
         
         // Step 1: Restore slot
@@ -429,8 +481,33 @@ async function main() {
         console.log('Send mode complete!');
         return;
     }
+    
+    // Handle --save "filename"
+    if (USE_SAVE) {
+        console.log(`\n=== Save Mode ===`);
+        
+        // Get the filename from the next argument after --save
+        const saveIndex = args.indexOf('--save');
+        if (saveIndex === -1 || saveIndex === args.length - 1) {
+            console.error('Error: --save requires a filename argument');
+            console.error('Usage: node test-server.mjs --save <filename>');
+            return;
+        }
+        const filenameArg = args[saveIndex + 1];
+        const filename = ensureStateExtension(filenameArg);
+        
+        console.log(`Saving to: ${filename}`);
+        
+        // Save slot
+        await saveSlot(SLOT_IDX, filename, 'save');
+        
+        console.log('\n' + '='.repeat(50));
+        console.log('Save mode complete!');
+        return;
+    }
 
-    console.log(`no flags specified`);
+    console.log(`no flags specified; getting slots`);
+    await getSlots();
 
     // // Default mode: full workflow
     // console.log(`\n=== Default Mode ===`);
