@@ -1277,6 +1277,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    if (llama_model_n_swa(model) == 0) {
+        if (params.swa_full) {
+            params.swa_full = false;
+            // cparams.swa_full
+            LOG_WRN("%s: swa_full is not supported by this model, it will be disabled\n", __func__);
+        }
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
@@ -1332,9 +1340,16 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
-        LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
-        params.ctx_shift = false;
+    if (!llama_memory_can_shift(llama_get_memory(lctx))) {
+        if (params.ctx_shift) {
+            LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
+            params.ctx_shift = false;
+        }
+
+        if (params.n_cache_reuse) {
+            LOG_WRN("%s: KV cache reuse is not supported for this context, disabling KV cache reuse\n", __func__);
+            params.n_cache_reuse = 0;
+        }
     }
 
     if (!params.control_vectors.empty()) {

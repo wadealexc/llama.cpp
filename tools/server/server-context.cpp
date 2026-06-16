@@ -730,50 +730,9 @@ private:
 
     bool sleeping = false;
 
-    void destroy() {
-        spec.reset();
-        ctx_dft.reset();
-        model_dft.reset();
-
-        llama_init.reset();
-
-        ctx_tgt = nullptr;
-        model_tgt = nullptr;
-
-        mtmd_free(mctx);
-        mctx = nullptr;
-
-        llama_batch_free(batch);
-    }
-
-    void handle_sleeping_state(bool new_state) {
-        GGML_ASSERT(sleeping != new_state);
-        if (new_state) {
-            SRV_INF("%s", "server is entering sleeping state\n");
-            destroy();
-        } else {
-            SRV_INF("%s", "server is exiting sleeping state\n");
-            if (!load_model(params_base)) {
-                GGML_ABORT("failed to reload model after sleeping");
-            }
-        }
-        sleeping = new_state;
-    }
-
-    // load the model and initialize llama_context
-    // this may also be called to resume from sleeping state
-    bool load_model(common_params & params) {
-        bool is_resume = sleeping;
-
-        SRV_INF("loading model '%s'\n", params.model.path.c_str());
-
-        params_base = params;
-        params_base.n_outputs_max = server_n_outputs_max(params_base);
-
-        std::string & mmproj_path = params_base.mmproj.path;
-        bool has_mmproj = !mmproj_path.empty();
+    mtmd_context_params build_mtmd_context_params(const std::string & mmproj_path) const {
         mtmd_context_params mparams = mtmd_context_params_default();
-        if (has_mmproj) {
+        if (!mmproj_path.empty()) {
             mparams.use_gpu          = params_base.mmproj_use_gpu;
             mparams.print_timings    = false;
             mparams.n_threads        = params_base.cpuparams.n_threads;
@@ -783,9 +742,11 @@ private:
             mparams.image_max_tokens = params_base.image_max_tokens;
             mparams.media_marker     = get_media_marker();
         }
+        return mparams;
+    }
 
-        // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+    void reserve_mmproj_memory_budget(const std::string & mmproj_path, const mtmd_context_params & mparams) {
+        if (!mmproj_path.empty()) {
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             if (!mmproj_mem.empty()) {
                 size_t total = 0;
@@ -809,85 +770,86 @@ private:
                 SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
             }
         }
+    }
 
-        // optionally reserve VRAM for the draft / MTP context before fitting the target model
-        if (params_base.fit_params) {
-            const bool spec_mtp = params_base.speculative.has_spec_mtp();
-            const bool has_draft = params_base.speculative.has_dft();
+    void reserve_draft_memory_budget() {
+        const bool spec_mtp = params_base.speculative.has_spec_mtp();
+        const bool has_draft = params_base.speculative.has_dft();
 
-            if (has_draft || spec_mtp) {
-                common_params params_dft = params_base;
-                bool measure_model_bytes = true;
+        if (has_draft || spec_mtp) {
+            common_params params_dft = params_base;
+            bool measure_model_bytes = true;
 
-                if (has_draft) {
-                    const auto & params_spec = params_base.speculative.draft;
-                    params_dft.devices               = params_spec.devices;
-                    params_dft.model                 = params_spec.mparams;
-                    params_dft.n_gpu_layers          = params_spec.n_gpu_layers;
-                    params_dft.cache_type_k          = params_spec.cache_type_k;
-                    params_dft.cache_type_v          = params_spec.cache_type_v;
-                    params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
-                } else {
-                    // MTP draft context lives on the target model, only context+compute are new
-                    measure_model_bytes = false;
+            if (has_draft) {
+                const auto & params_spec = params_base.speculative.draft;
+                params_dft.devices               = params_spec.devices;
+                params_dft.model                 = params_spec.mparams;
+                params_dft.n_gpu_layers          = params_spec.n_gpu_layers;
+                params_dft.cache_type_k          = params_spec.cache_type_k;
+                params_dft.cache_type_v          = params_spec.cache_type_v;
+                params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+            } else {
+                // MTP draft context lives on the target model, only context+compute are new
+                measure_model_bytes = false;
+            }
+
+            params_dft.n_outputs_max = params_base.n_parallel;
+
+            auto mparams_dft = common_model_params_to_llama(params_dft);
+            auto cparams_dft = common_context_params_to_llama(params_dft);
+            if (spec_mtp) {
+                cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                cparams_dft.type_k   = params_base.speculative.draft.cache_type_k;
+                cparams_dft.type_v   = params_base.speculative.draft.cache_type_v;
+            }
+            cparams_dft.n_rs_seq = 0;
+
+            std::vector<ggml_backend_dev_t> devs;
+            uint32_t hp_ngl = 0;
+            uint32_t hp_nct = 0;
+            uint32_t hp_nex = 0;
+            try {
+                auto dmd = common_get_device_memory_data(
+                    params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                    devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+
+                GGML_ASSERT(!params_base.fit_params_target.empty());
+                size_t total = 0;
+
+                std::vector<ggml_backend_dev_t> tgt_devices = params_base.devices;
+
+                if (tgt_devices.empty()) {
+                    for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                       tgt_devices.push_back(ggml_backend_dev_get(i));
+                    }
                 }
 
-                params_dft.n_outputs_max = params_base.n_parallel;
-
-                auto mparams_dft = common_model_params_to_llama(params_dft);
-                auto cparams_dft = common_context_params_to_llama(params_dft);
-                if (spec_mtp) {
-                    cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-                    cparams_dft.type_k   = params_base.speculative.draft.cache_type_k;
-                    cparams_dft.type_v   = params_base.speculative.draft.cache_type_v;
-                }
-                cparams_dft.n_rs_seq = 0;
-
-                std::vector<ggml_backend_dev_t> devs;
-                uint32_t hp_ngl = 0;
-                uint32_t hp_nct = 0;
-                uint32_t hp_nex = 0;
-                try {
-                    auto dmd = common_get_device_memory_data(
-                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
-                        devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
-
-                    GGML_ASSERT(!params_base.fit_params_target.empty());
-                    size_t total = 0;
-
-                    std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
-
-                    if (tgt_devices.empty()) {
-                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                           tgt_devices.push_back(ggml_backend_dev_get(i));
+                for (size_t j = 0; j < devs.size(); ++j) {
+                    const size_t bytes =
+                        (measure_model_bytes ? dmd[j].mb.model : 0) +
+                        dmd[j].mb.context +
+                        dmd[j].mb.compute;
+                    total += bytes;
+                    for (size_t i = 0; i < tgt_devices.size(); i++) {
+                        if (tgt_devices[i] == devs[j]) {
+                            SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
+                                    bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
+                            params_base.fit_params_target[i] += bytes;
+                            break;
                         }
                     }
-
-                    for (size_t j = 0; j < devs.size(); ++j) {
-                        const size_t bytes =
-                            (measure_model_bytes ? dmd[j].mb.model : 0) +
-                            dmd[j].mb.context +
-                            dmd[j].mb.compute;
-                        total += bytes;
-                        for (size_t i = 0; i < tgt_devices.size(); i++) {
-                            if (tgt_devices[i] == devs[j]) {
-                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
-                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
-                                params_base.fit_params_target[i] += bytes;
-                                break;
-                            }
-                        }
-                    }
-                    SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
-                            has_draft ? "draft model" : "MTP context",
-                            total / (1024.0 * 1024.0));
-                } catch (const std::exception & e) {
-                    SRV_WRN("[spec] failed to measure %s memory: %s\n",
-                            has_draft ? "draft model" : "MTP context", e.what());
                 }
+                SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
+                        has_draft ? "draft model" : "MTP context",
+                        total / (1024.0 * 1024.0));
+            } catch (const std::exception & e) {
+                SRV_WRN("[spec] failed to measure %s memory: %s\n",
+                        has_draft ? "draft model" : "MTP context", e.what());
             }
         }
+    }
 
+    bool load_main_model_and_context() {
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -904,6 +866,10 @@ private:
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
+        return true;
+    }
+
+    bool load_draft_context() {
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
@@ -971,7 +937,11 @@ private:
             params_base.speculative.draft.ctx_dft = ctx_dft.get();
         }
 
-        if (has_mmproj) {
+        return true;
+    }
+
+    bool load_mmproj(const std::string & mmproj_path, const mtmd_context_params & mparams, bool is_resume) {
+        if (!mmproj_path.empty()) {
             if (!is_resume) {
                 mtmd_helper_log_set(common_log_default_callback, nullptr);
             }
@@ -983,6 +953,10 @@ private:
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
 
+            // TODO - I feel like if we pulled these two checks into some sort of validate_params
+            // preflight method that both load_model and reload_context used, we could pull the rest
+            // of load_mmproj into the parent method and avoid the indirection of using a helper.
+            // That would probably be cleaner.
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
@@ -993,26 +967,10 @@ private:
                 SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
             }
         }
+        return true;
+    }
 
-        if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
-            if (params_base.ctx_shift) {
-                params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
-            }
-
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by this context, it will be disabled");
-            }
-        }
-
-        if (llama_model_n_swa(model_tgt) == 0) {
-            if (params_base.swa_full) {
-                params_base.swa_full = false;
-                SRV_WRN("%s\n", "swa_full is not supported by this model, it will be disabled");
-            }
-        }
-
+    void setup_server_runtime_state() {
         n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
 
         // Necessary similarity of prompt for slot selection
@@ -1144,6 +1102,70 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+    }
+
+    void destroy() {
+        spec.reset();
+        ctx_dft.reset();
+        model_dft.reset();
+
+        llama_init.reset();
+
+        ctx_tgt = nullptr;
+        model_tgt = nullptr;
+
+        mtmd_free(mctx);
+        mctx = nullptr;
+
+        llama_batch_free(batch);
+    }
+
+    void handle_sleeping_state(bool new_state) {
+        GGML_ASSERT(sleeping != new_state);
+        if (new_state) {
+            SRV_INF("%s", "server is entering sleeping state\n");
+            destroy();
+        } else {
+            SRV_INF("%s", "server is exiting sleeping state\n");
+            if (!load_model(params_base)) {
+                GGML_ABORT("failed to reload model after sleeping");
+            }
+        }
+        sleeping = new_state;
+    }
+
+    // load the model and initialize llama_context
+    // this may also be called to resume from sleeping state
+    bool load_model(common_params & params) {
+        bool is_resume = sleeping;
+
+        SRV_INF("loading model '%s'\n", params.model.path.c_str());
+
+        params_base = params;
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        std::string & mmproj_path = params_base.mmproj.path;
+        const mtmd_context_params mparams = build_mtmd_context_params(mmproj_path);
+
+        // optionally reserve fit mmproj and draft / MTP context before fitting the target model
+        if (params_base.fit_params) {
+            reserve_mmproj_memory_budget(mmproj_path, mparams);
+            reserve_draft_memory_budget();
+        }
+
+        if (!load_main_model_and_context()) {
+            return false;
+        }
+
+        if (!load_draft_context()) {
+            return false;
+        }
+
+        if (!load_mmproj(mmproj_path, mparams, is_resume)) {
+            return false;
+        }
+
+        setup_server_runtime_state();
 
         // propagate new defaults back to caller
         params = params_base;
