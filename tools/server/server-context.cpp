@@ -869,6 +869,16 @@ private:
         return true;
     }
 
+    bool load_context_only() {
+        common_init_context_from_model(llama_init, model_tgt);
+
+        ctx_tgt = llama_init->context();
+
+        n_ctx = llama_n_ctx(ctx_tgt);
+
+        return true;
+    }
+
     bool load_draft_context() {
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
@@ -1162,6 +1172,61 @@ private:
         }
 
         if (!load_mmproj(mmproj_path, mparams, is_resume)) {
+            return false;
+        }
+
+        setup_server_runtime_state();
+
+        // propagate new defaults back to caller
+        params = params_base;
+
+        if (!is_resume) {
+            return init();
+        }
+
+        return true;
+    }
+
+    bool reload_context(common_params & params) {
+        bool is_resume = sleeping;
+        // TODO - this is more of a high level API question, but at least right now,
+        // it doesn't make sense to reload context when sleeping, as waking up
+        // requires a full model reload.
+        GGML_ASSERT(!sleeping);
+
+        GGML_ASSERT(model_tgt != nullptr);
+
+        destroy_context_only();
+
+        SRV_INF("loading context for existing model '%s'\n", params.model.path.c_str());
+
+        // TODO - merge selectively?
+        params_base = params;
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        std::string & mmproj_path = params_base.mmproj.path;
+        const mtmd_context_params mparams = build_mtmd_context_params(mmproj_path);
+
+        // optionally reserve fit mmproj and draft / MTP context before fitting the target model
+        if (params_base.fit_params) {
+            reset_fit_params_baseline();
+            reserve_mmproj_memory_budget(mmproj_path, mparams);
+            reserve_draft_memory_budget();
+        }
+
+        if (!load_context_only()) {
+            return false;
+        }
+
+        // TODO:
+        // 1. Naming-wise, the load_model path calling this load_draft_context() is a little unclear
+        // 2. Just noting that one of the paths in load_draft_context actually is context-only. Might
+        //    be possible to give this method a clean split into `load_draft_model()` and `load_draft_context()`?
+        if (!load_draft_context_only()) {
+            return false;
+        }
+
+        if (!load_mmproj(mmproj_path, mparams)) {
             return false;
         }
 
