@@ -869,6 +869,8 @@ struct common_init_result {
 
     llama_model * model();
     llama_context * context();
+    llama_context * reinit_context(common_params & params);
+    void reset_context();
 
     common_sampler * sampler(llama_seq_id seq_id);
     void reset_samplers();
@@ -876,6 +878,8 @@ struct common_init_result {
     std::vector<llama_adapter_lora_ptr> & lora();
 
 private:
+    void init_context_inner(common_params & params);
+
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
