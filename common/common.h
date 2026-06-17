@@ -867,6 +867,8 @@ struct common_init_result {
     common_init_result(common_params & params, bool model_only = false);
     ~common_init_result();
 
+    bool reinit_context(common_params & params);
+
     llama_model * model();
     llama_context * context();
 
@@ -875,7 +877,11 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    bool apply_post_context_steps(common_params & params);
+
 private:
+    bool init_context_inner(common_params & params, llama_context_params & cparams);
+
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
