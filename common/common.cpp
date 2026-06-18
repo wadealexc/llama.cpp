@@ -1309,9 +1309,16 @@ void common_init_result::init_context_inner(common_params & params) {
     // Also worth asking if some of these return-early branches (e.g. cvec) should
     // actually be returning early. If these are definitely error states, we should 
     // probably do actual cleanup (e.g. context.reset())
-    if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
-        LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
-        params.ctx_shift = false;
+    if (!llama_memory_can_shift(llama_get_memory(lctx))) {
+        if (params.ctx_shift) {
+            LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
+            params.ctx_shift = false;
+        }
+        
+        if (params.n_cache_reuse) {
+            LOG_WRN("%s: KV cache reuse is not supported for this context, it will be disabled\n", __func__);
+            params.n_cache_reuse = 0;
+        }
     }
 
     if (!params.control_vectors.empty()) {
