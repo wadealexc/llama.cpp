@@ -1183,19 +1183,14 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory ...\n", __func__);
         LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        common_fit_from_params(params);
     }
+
+    auto mparams = common_model_params_to_llama(params);
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
@@ -1214,7 +1209,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
         if (lora == nullptr) {
             LOG_ERR("%s: failed to load lora adapter '%s'\n", __func__, la.path.c_str());
-            pimpl->model.reset(model); // @fox redundant
+            pimpl->model.reset(model);
             return;
         }
 
@@ -1450,21 +1445,11 @@ llama_context * common_init_result::reinit_context(common_params & params) {
     // reset lora, samplers, and context
     reset_context();
 
-    // TODO - validate mparams against existing model (maybe just fetch from existing model? needs field.)
-    // NOTE: p.tensor_split and p.tensor_buft_overrides are in mparams already.
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
-
     // TODO - variant of common_fit that takes a model pointer so we don't load it internally
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory ...\n", __func__);
         LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        common_fit_from_params(params);
     }
 
     init_context_inner(params);
@@ -1657,6 +1642,29 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     return cparams;
+}
+
+bool common_fit_from_params(common_params & params) {
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+
+    auto status = common_fit_params(
+        params.model.path.c_str(), &mparams, &cparams,
+        params.tensor_split,
+        params.tensor_buft_overrides.data(),
+        params.fit_params_target.data(),
+        params.fit_params_min_ctx,
+        params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    
+    // tensor_split, tensor_buft_overrides, and fit_params_target are owned by params;
+    // mutations are already persisted
+    if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        params.n_ctx        = cparams.n_ctx;
+        params.n_gpu_layers = mparams.n_gpu_layers;
+        return true;
+    }
+    
+    return false;
 }
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {

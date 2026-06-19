@@ -891,6 +891,9 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+// convenience wrapper for common_fit_params that persists mutations back to params
+// NOTE: must be kept in sync with fit's mutation surface.
+bool common_fit_from_params(struct common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
