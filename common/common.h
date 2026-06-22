@@ -895,6 +895,9 @@ struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const commo
 // NOTE: must be kept in sync with fit's mutation surface.
 bool common_fit_from_params(struct common_params & params);
 
+// overlay context-specific params from ctx onto params
+void common_overlay_context_params(common_params & params, llama_context_params ctx);
+
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 
