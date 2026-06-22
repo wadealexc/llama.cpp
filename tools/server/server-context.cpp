@@ -757,10 +757,6 @@ private:
         ctx_dft.reset();
         model_dft.reset();
 
-        // llama_init.reset();
-        // ctx_tgt = nullptr;
-        // model_tgt = nullptr;
-
         mtmd_free(mctx);
         mctx = nullptr;
 
@@ -979,14 +975,14 @@ private:
         return true;
     }
 
-    void setup_runtime_state() {
-        n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+    void setup_runtime_state(common_params & params) {
+        n_swa = params.swa_full ? 0 : llama_model_n_swa(model_tgt);
 
         // Necessary similarity of prompt for slot selection
-        slot_prompt_similarity = params_base.slot_prompt_similarity;
+        slot_prompt_similarity = params.slot_prompt_similarity;
 
         // setup slots
-        SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
+        SRV_INF("initializing slots, n_slots = %d\n", params.n_parallel);
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
@@ -1008,14 +1004,14 @@ private:
         }
 
         // initialize slots
-        for (int i = 0; i < params_base.n_parallel; i++) {
+        for (int i = 0; i < params.n_parallel; i++) {
             slots.emplace_back();
         }
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                spec.reset(common_speculative_init(params.speculative, params.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
             }
@@ -1031,7 +1027,7 @@ private:
             ctx_dft.reset();
         }
 
-        for (int i = 0; i < params_base.n_parallel; i++) {
+        for (int i = 0; i < params.n_parallel; i++) {
             server_slot & slot = slots[i];
 
             slot.id      = i;
@@ -1074,43 +1070,43 @@ private:
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
-            batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
+            batch = llama_batch_init(std::max(n_batch, params.n_parallel), 0, 1);
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
+        if (params.cache_ram_mib != 0) {
+            if (params.cache_ram_mib < 0) {
                 SRV_INF("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
-                SRV_INF("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+                SRV_INF("prompt cache is enabled, size limit: %d MiB\n", params.cache_ram_mib);
             }
             SRV_INF("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params.cache_ram_mib, n_ctx);
         } else {
             SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_INF("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
-        if (params_base.n_ctx_checkpoints > 0) {
+        if (params.n_ctx_checkpoints > 0) {
             SRV_INF("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+                    params.n_ctx_checkpoints, params.checkpoint_min_step);
         } else {
             SRV_INF("%s", "context checkpoints disabled\n");
         }
 
-        if (!params_base.model_alias.empty()) {
+        if (!params.model_alias.empty()) {
             // backward compat: use first alias as model name
-            model_name = *params_base.model_alias.begin();
-        } else if (!params_base.model.name.empty()) {
-            model_name = params_base.model.name;
+            model_name = *params.model_alias.begin();
+        } else if (!params.model.name.empty()) {
+            model_name = params.model.name;
         } else {
             // fallback: derive model name from file name
-            auto model_path = std::filesystem::path(params_base.model.path);
+            auto model_path = std::filesystem::path(params.model.path);
             model_name = model_path.filename().string();
         }
 
-        model_aliases = params_base.model_alias;
-        model_tags    = params_base.model_tags;
+        model_aliases = params.model_alias;
+        model_tags    = params.model_tags;
     }
 
     // load the model and initialize llama_context
@@ -1181,7 +1177,7 @@ private:
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str()); 
         }
 
-        setup_runtime_state();
+        setup_runtime_state(params_base);
 
         // propagate new defaults back to caller
         params = params_base;
@@ -1201,6 +1197,7 @@ private:
         common_params new_params = params_base;
         common_overlay_context_params(new_params, new_params_ctx);
         new_params.fit_params_target = original_fit_target_snapshot;
+        new_params.n_outputs_max = server_n_outputs_max(new_params);
 
         std::string & mmproj_path = new_params.mmproj.path;
         bool has_mmproj = !mmproj_path.empty();
@@ -1210,7 +1207,7 @@ private:
         // 2. reinit mmproj params
         mtmd_context_params mparams = build_mtmd_context_params(new_params);
 
-        // 3. rerun pre-load fit
+        // 3. rerun pre-load and main model fit
         if (new_params.fit_params) {
             if (has_mmproj) {
                 reserve_mmproj_memory_budget(new_params, mparams);
@@ -1219,14 +1216,18 @@ private:
             if (has_draft || spec_mtp) {
                 reserve_draft_memory_budget(new_params);
             }
+
+            // apply main model fit early. if it fails, we abort before tearing down ctx
+            if (!common_fit_from_params(new_params)) {
+                SRV_ERR("%s\n", "fit failed for new params, aborting");
+                return false;
+            }
         }
 
         // 4. tear down existing context
         destroy_context();
 
         // 5. reinit context
-        // TODO - could consider doing main model fit out here, before 4.A (so that if it fails,
-        // we don't tear down context and can exit gracefully). For now this is fine.
         llama_context * new_ctx_tgt = llama_init->reinit_context(new_params);
         if (new_ctx_tgt == nullptr) {
             SRV_ERR("%s\n", "failed to reinit context");
@@ -1242,7 +1243,7 @@ private:
 
         // 6. load draft/spec model and context
         if (has_draft || spec_mtp) {
-            if (!load_draft_context(params_base)) {
+            if (!load_draft_context(new_params)) {
                 return false;
             }
         }
@@ -1258,7 +1259,7 @@ private:
         }
 
         // 8. remaining server state setup
-        setup_runtime_state();
+        setup_runtime_state(new_params);
 
         // persist new defaults
         params_base = new_params;

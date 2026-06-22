@@ -1432,7 +1432,6 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 // void common_init_result::
 
 void common_init_result::reset_context() {
-    pimpl->lora.clear();
     pimpl->samplers.clear();
     pimpl->samplers_seq_config.clear();
     pimpl->context.reset();
@@ -1442,15 +1441,8 @@ llama_context * common_init_result::reinit_context(common_params & params) {
     llama_model * model = pimpl->model.get();
     GGML_ASSERT(model);
 
-    // reset lora, samplers, and context
+    // reset samplers and context
     reset_context();
-
-    // TODO - variant of common_fit that takes a model pointer so we don't load it internally
-    if (params.fit_params) {
-        LOG_INF("%s: fitting params to device memory ...\n", __func__);
-        LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
-        common_fit_from_params(params);
-    }
 
     init_context_inner(params);
 
