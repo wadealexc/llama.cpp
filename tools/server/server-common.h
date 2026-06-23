@@ -311,6 +311,9 @@ json oaicompat_chat_params_parse(
     const server_chat_params & opt,
     std::vector<raw_buffer> & out_files);
 
+// parse common_params from JSON body, starting with defaults from params_base
+common_params common_params_from_json(const common_params & params_base, const json & body);
+
 // TODO: move it to server-task.cpp
 json format_embeddings_response_oaicompat(
     const json & request,

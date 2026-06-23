@@ -1183,19 +1183,14 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory ...\n", __func__);
         LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        common_fit_from_params(params);
     }
+
+    auto mparams = common_model_params_to_llama(params);
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
@@ -1207,8 +1202,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (model_only) {
         return;
     }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
@@ -1228,6 +1221,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         la.prompt_prefix = buf;
         pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
     }
+
+    init_context_inner(params);
+}
+
+void common_init_result::init_context_inner(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    GGML_ASSERT(model);
+
+    if (llama_model_n_swa(model) == 0) {
+        if (params.swa_full) {
+            params.swa_full = false;
+            LOG_WRN("%s: swa_full is not supported by this model, it will be disabled\n", __func__);
+        }
+    }
+
+    auto cparams = common_context_params_to_llama(params);
+
+    const llama_vocab * vocab = llama_model_get_vocab(pimpl->model.get());
 
     // updates params.sampling
     // TODO: fix naming
@@ -1284,57 +1295,25 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
-}
 
-llama_model * common_init_result::model() {
-    return pimpl->model.get();
-}
-
-llama_context * common_init_result::context() {
-    return pimpl->context.get();
-}
-
-common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
-    if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
-        return nullptr;
-    }
-    return pimpl->samplers[seq_id].get();
-}
-
-void common_init_result::reset_samplers() {
-    for (int i = 0; i < (int) pimpl->samplers.size(); ++i) {
-        llama_sampler_reset(common_sampler_get(pimpl->samplers[i].get()));
-    }
-}
-
-std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
-    return pimpl->lora;
-}
-
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
-
-    llama_model * model = res->model();
-    if (model == NULL) {
-        LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
-        return res;
-    }
-
-    if (model_only) {
-        return res;
-    }
-
-    llama_context * lctx = res->context();
-    if (lctx == NULL) {
-        LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
-        return res;
-    }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-
-    if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
-        LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
-        params.ctx_shift = false;
+    // TODO - I'm not a huge fan of dumping all of this in init_context_inner,
+    // but it's a disjointed collection of concepts as it is. Maybe better as
+    // a sequence of helper methods, or picking/choosing portions to live here
+    // vs elsewhere?
+    //
+    // Also worth asking if some of these return-early branches (e.g. cvec) should
+    // actually be returning early. If these are definitely error states, we should 
+    // probably do actual cleanup (e.g. context.reset())
+    if (!llama_memory_can_shift(llama_get_memory(lctx))) {
+        if (params.ctx_shift) {
+            LOG_WRN("%s: KV cache shifting is not supported for this context, disabling KV cache shifting\n", __func__);
+            params.ctx_shift = false;
+        }
+        
+        if (params.n_cache_reuse) {
+            LOG_WRN("%s: KV cache reuse is not supported for this context, it will be disabled\n", __func__);
+            params.n_cache_reuse = 0;
+        }
     }
 
     if (!params.control_vectors.empty()) {
@@ -1343,7 +1322,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         const auto cvec = common_control_vector_load(params.control_vectors);
         if (cvec.n_embd == -1) {
-            return res;
+            return;
         }
 
         int err = llama_set_adapter_cvec(
@@ -1354,7 +1333,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 params.control_vector_layer_start,
                 params.control_vector_layer_end);
         if (err) {
-            return res;
+            return;
         }
     }
 
@@ -1378,7 +1357,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
 
         if (!ok) {
-            return res;
+            return;
         }
     }
 
@@ -1421,7 +1400,72 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_perf_context_reset(lctx);
 
         // reset samplers to reset RNG state after warmup to the seeded state
-        res->reset_samplers();
+        reset_samplers();
+    }
+}
+
+llama_model * common_init_result::model() {
+    return pimpl->model.get();
+}
+
+llama_context * common_init_result::context() {
+    return pimpl->context.get();
+}
+
+common_sampler * common_init_result::sampler(llama_seq_id seq_id) {
+    if (seq_id < 0 || seq_id >= (int) pimpl->samplers.size()) {
+        return nullptr;
+    }
+    return pimpl->samplers[seq_id].get();
+}
+
+void common_init_result::reset_samplers() {
+    for (int i = 0; i < (int) pimpl->samplers.size(); ++i) {
+        llama_sampler_reset(common_sampler_get(pimpl->samplers[i].get()));
+    }
+}
+
+std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
+    return pimpl->lora;
+}
+
+// void common_init_result::
+
+void common_init_result::reset_context() {
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
+    pimpl->context.reset();
+}
+
+llama_context * common_init_result::reinit_context(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    GGML_ASSERT(model);
+
+    // reset samplers and context
+    reset_context();
+
+    init_context_inner(params);
+
+    return pimpl->context.get();
+}
+
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    llama_context * lctx = res->context();
+    if (lctx == NULL) {
+        LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.path.c_str());
+        return res;
     }
 
     return res;
@@ -1590,6 +1634,62 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     return cparams;
+}
+
+bool common_fit_from_params(common_params & params) {
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+
+    auto status = common_fit_params(
+        params.model.path.c_str(), &mparams, &cparams,
+        params.tensor_split,
+        params.tensor_buft_overrides.data(),
+        params.fit_params_target.data(),
+        params.fit_params_min_ctx,
+        params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    
+    // tensor_split, tensor_buft_overrides, and fit_params_target are owned by params;
+    // mutations are already persisted
+    if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        params.n_ctx        = cparams.n_ctx;
+        params.n_gpu_layers = mparams.n_gpu_layers;
+        return true;
+    }
+    
+    return false;
+}
+
+void common_overlay_context_params(common_params & params, llama_context_params ctx) {
+    params.n_ctx             = ctx.n_ctx;
+    params.n_parallel        = ctx.n_seq_max;
+    params.n_outputs_max     = ctx.n_outputs_max;
+    params.n_batch           = ctx.n_batch;
+    params.n_ubatch          = ctx.n_ubatch;
+
+    params.cpuparams.n_threads       = ctx.n_threads;
+    params.cpuparams_batch.n_threads = ctx.n_threads_batch;
+
+    params.embedding         = ctx.embeddings;
+    params.rope_scaling_type = ctx.rope_scaling_type;
+    params.rope_freq_base    = ctx.rope_freq_base;
+    params.rope_freq_scale   = ctx.rope_freq_scale;
+    params.yarn_ext_factor   = ctx.yarn_ext_factor;
+    params.yarn_attn_factor  = ctx.yarn_attn_factor;
+    params.yarn_beta_fast    = ctx.yarn_beta_fast;
+    params.yarn_beta_slow    = ctx.yarn_beta_slow;
+    params.yarn_orig_ctx     = ctx.yarn_orig_ctx;
+    params.pooling_type      = ctx.pooling_type;
+    params.attention_type    = ctx.attention_type;
+    params.flash_attn_type   = ctx.flash_attn_type;
+    params.cb_eval           = ctx.cb_eval;
+    params.cb_eval_user_data = ctx.cb_eval_user_data;
+    params.no_kv_offload     = !ctx.offload_kqv;
+    params.no_perf           = ctx.no_perf;
+    params.no_op_offload     = !ctx.op_offload;
+    params.swa_full          = ctx.swa_full;
+    params.kv_unified        = ctx.kv_unified;
+    params.cache_type_k      = ctx.type_k;
+    params.cache_type_v      = ctx.type_v;
 }
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {

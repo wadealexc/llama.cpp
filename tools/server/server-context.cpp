@@ -728,6 +728,9 @@ private:
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
 
+    // snapshot of original fit_params_target before any modifications
+    std::vector<size_t> original_fit_target_snapshot;
+
     bool sleeping = false;
 
     void destroy() {
@@ -739,6 +742,20 @@ private:
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
+
+        mtmd_free(mctx);
+        mctx = nullptr;
+
+        llama_batch_free(batch);
+    }
+
+    void destroy_context() {
+        slots.clear();
+        prompt_cache.reset();
+        
+        spec.reset();
+        ctx_dft.reset();
+        model_dft.reset();
 
         mtmd_free(mctx);
         mctx = nullptr;
@@ -760,272 +777,212 @@ private:
         sleeping = new_state;
     }
 
-    // load the model and initialize llama_context
-    // this may also be called to resume from sleeping state
-    bool load_model(common_params & params) {
-        bool is_resume = sleeping;
+    struct draft_init_params {
+        common_params        params;
+        llama_model_params   mparams;
+        llama_context_params cparams;
+        std::string          model_path;
+    };
 
-        SRV_INF("loading model '%s'\n", params.model.path.c_str());
+    // TODO speculative: move to common/speculative.cpp?
+    static void init_draft_params(common_params & params_in, draft_init_params & out) {
+        out.params = params_in;
+        const auto & params_spec = params_in.speculative.draft;
+        out.model_path = params_in.model.path;
 
-        params_base = params;
-        params_base.n_outputs_max = server_n_outputs_max(params_base);
+        if (params_in.speculative.has_dft()) {
+            out.params.devices               = params_spec.devices;
+            out.params.model                 = params_spec.mparams;
+            out.params.n_gpu_layers          = params_spec.n_gpu_layers;
+            out.params.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
-        std::string & mmproj_path = params_base.mmproj.path;
-        bool has_mmproj = !mmproj_path.empty();
-        mtmd_context_params mparams = mtmd_context_params_default();
-        if (has_mmproj) {
-            mparams.use_gpu          = params_base.mmproj_use_gpu;
-            mparams.print_timings    = false;
-            mparams.n_threads        = params_base.cpuparams.n_threads;
-            mparams.flash_attn_type  = params_base.flash_attn_type;
-            mparams.warmup           = params_base.warmup;
-            mparams.image_min_tokens = params_base.image_min_tokens;
-            mparams.image_max_tokens = params_base.image_max_tokens;
-            mparams.media_marker     = get_media_marker();
-        }
-
-        // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
-            auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
-            if (!mmproj_mem.empty()) {
-                size_t total = 0;
-                for (auto & [dev, size] : mmproj_mem) {
-                    total += size;
-                }
-                SRV_INF("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB\n", total / (1024.0 * 1024.0));
-                GGML_ASSERT(!params_base.fit_params_target.empty());
-                for (auto & [dev, size] : mmproj_mem) {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
-                            if (i < params_base.fit_params_target.size()) {
-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
-                                params_base.fit_params_target[i] += size;
-                            }
-                            break;
-                        }
-                    }
-                }
-            } else {
-                SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
-            }
-        }
-
-        // optionally reserve VRAM for the draft / MTP context before fitting the target model
-        if (params_base.fit_params) {
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-            const bool has_draft = params_base.speculative.has_dft();
-
-            if (has_draft || spec_mtp) {
-                common_params params_dft = params_base;
-                bool measure_model_bytes = true;
-
-                if (has_draft) {
-                    const auto & params_spec = params_base.speculative.draft;
-                    params_dft.devices               = params_spec.devices;
-                    params_dft.model                 = params_spec.mparams;
-                    params_dft.n_gpu_layers          = params_spec.n_gpu_layers;
-                    params_dft.cache_type_k          = params_spec.cache_type_k;
-                    params_dft.cache_type_v          = params_spec.cache_type_v;
-                    params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
-                } else {
-                    // MTP draft context lives on the target model, only context+compute are new
-                    measure_model_bytes = false;
-                }
-
-                params_dft.n_outputs_max = params_base.n_parallel;
-
-                auto mparams_dft = common_model_params_to_llama(params_dft);
-                auto cparams_dft = common_context_params_to_llama(params_dft);
-                if (spec_mtp) {
-                    cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-                    cparams_dft.type_k   = params_base.speculative.draft.cache_type_k;
-                    cparams_dft.type_v   = params_base.speculative.draft.cache_type_v;
-                }
-                cparams_dft.n_rs_seq = 0;
-
-                std::vector<ggml_backend_dev_t> devs;
-                uint32_t hp_ngl = 0;
-                uint32_t hp_nct = 0;
-                uint32_t hp_nex = 0;
-                try {
-                    auto dmd = common_get_device_memory_data(
-                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
-                        devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
-
-                    GGML_ASSERT(!params_base.fit_params_target.empty());
-                    size_t total = 0;
-
-                    std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
-
-                    if (tgt_devices.empty()) {
-                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                           tgt_devices.push_back(ggml_backend_dev_get(i));
-                        }
-                    }
-
-                    for (size_t j = 0; j < devs.size(); ++j) {
-                        const size_t bytes =
-                            (measure_model_bytes ? dmd[j].mb.model : 0) +
-                            dmd[j].mb.context +
-                            dmd[j].mb.compute;
-                        total += bytes;
-                        for (size_t i = 0; i < tgt_devices.size(); i++) {
-                            if (tgt_devices[i] == devs[j]) {
-                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
-                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
-                                params_base.fit_params_target[i] += bytes;
-                                break;
-                            }
-                        }
-                    }
-                    SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
-                            has_draft ? "draft model" : "MTP context",
-                            total / (1024.0 * 1024.0));
-                } catch (const std::exception & e) {
-                    SRV_WRN("[spec] failed to measure %s memory: %s\n",
-                            has_draft ? "draft model" : "MTP context", e.what());
-                }
-            }
-        }
-
-        llama_init = common_init_from_params(params_base);
-
-        model_tgt = llama_init->model();
-        ctx_tgt   = llama_init->context();
-
-        if (model_tgt == nullptr) {
-            SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
-            return false;
-        }
-
-        vocab = llama_model_get_vocab(model_tgt);
-
-        n_ctx = llama_n_ctx(ctx_tgt);
-
-        add_bos_token = llama_vocab_get_add_bos(vocab);
-
-        if (params_base.speculative.has_dft()) {
-            // TODO speculative: move to common/speculative.cpp?
-            const auto & params_spec = params_base.speculative.draft;
-
-            SRV_INF("loading draft model '%s'\n", params_spec.mparams.path.c_str());
-
-            auto params_dft = params_base;
-
-            params_dft.devices      = params_spec.devices;
-            params_dft.model        = params_spec.mparams;
-            params_dft.n_gpu_layers = params_spec.n_gpu_layers;
-            params_dft.cache_type_k = params_spec.cache_type_k;
-            params_dft.cache_type_v = params_spec.cache_type_v;
+            out.model_path = params_spec.mparams.path;
 
             if (params_spec.cpuparams.n_threads > 0) {
-                params_dft.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
-                params_dft.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+                out.params.cpuparams.n_threads       = params_spec.cpuparams.n_threads;
+                out.params.cpuparams_batch.n_threads = params_spec.cpuparams_batch.n_threads;
+            }
+        }
+
+        out.params.cache_type_k  = params_spec.cache_type_k;
+        out.params.cache_type_v  = params_spec.cache_type_v;
+        out.params.n_outputs_max = params_in.n_parallel;
+
+        out.mparams = common_model_params_to_llama(out.params);
+        out.cparams = common_context_params_to_llama(out.params);
+        if (params_in.speculative.has_spec_mtp()) {
+            out.cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        }
+
+        // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+        //       the extra memory for small models is likely negligible?
+        out.cparams.n_rs_seq = 0;
+    }
+
+    static mtmd_context_params build_mtmd_context_params(common_params & params) {
+        mtmd_context_params mparams = mtmd_context_params_default();
+
+        bool has_mmproj = !params.mmproj.path.empty();
+        if (!has_mmproj) {
+            return mparams;
+        }
+
+        mparams.use_gpu          = params.mmproj_use_gpu;
+        mparams.print_timings    = false;
+        mparams.n_threads        = params.cpuparams.n_threads;
+        mparams.flash_attn_type  = params.flash_attn_type;
+        mparams.warmup           = params.warmup;
+        mparams.image_min_tokens = params.image_min_tokens;
+        mparams.image_max_tokens = params.image_max_tokens;
+        mparams.media_marker     = get_media_marker();
+
+        if (params.ctx_shift) {
+            params.ctx_shift = false;
+            SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
+        }
+
+        if (params.n_cache_reuse) {
+            params.n_cache_reuse = 0;
+            SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
+        }
+        
+        return mparams;
+    }
+
+    static void reserve_mmproj_memory_budget(common_params & params, mtmd_context_params mparams) {
+        std::string & mmproj_path = params.mmproj.path;
+        GGML_ASSERT(!mmproj_path.empty());
+
+        auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+        if (!mmproj_mem.empty()) {
+            size_t total = 0;
+            for (auto & [dev, size] : mmproj_mem) {
+                total += size;
+            }
+            SRV_INF("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB\n", total / (1024.0 * 1024.0));
+            GGML_ASSERT(!params.fit_params_target.empty());
+            for (auto & [dev, size] : mmproj_mem) {
+                for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                    if (ggml_backend_dev_get(i) == dev) {
+                        if (i < params.fit_params_target.size()) {
+                            SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+                            params.fit_params_target[i] += size;
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
+        }
+    }
+
+    static void reserve_draft_memory_budget(common_params & params) {
+        const bool has_draft = params.speculative.has_dft();
+        const bool spec_mtp = params.speculative.has_spec_mtp();
+        GGML_ASSERT(has_draft || spec_mtp);
+        
+        // MTP draft context lives on the target model, only context+compute are new
+        bool measure_model_bytes = has_draft;
+
+        draft_init_params params_dft;
+        init_draft_params(params, params_dft);
+
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t hp_ngl = 0;
+        uint32_t hp_nct = 0;
+        uint32_t hp_nex = 0;
+        try {
+            auto dmd = common_get_device_memory_data(
+                params_dft.model_path.c_str(), &params_dft.mparams, &params_dft.cparams,
+                devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+
+            GGML_ASSERT(!params.fit_params_target.empty());
+            size_t total = 0;
+
+            std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
+
+            if (tgt_devices.empty()) {
+                for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                    tgt_devices.push_back(ggml_backend_dev_get(i));
+                }
             }
 
-            params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+            for (size_t j = 0; j < devs.size(); ++j) {
+                const size_t bytes =
+                    (measure_model_bytes ? dmd[j].mb.model : 0) +
+                    dmd[j].mb.context +
+                    dmd[j].mb.compute;
+                total += bytes;
+                for (size_t i = 0; i < tgt_devices.size(); i++) {
+                    if (tgt_devices[i] == devs[j]) {
+                        SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
+                                bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
+                        params.fit_params_target[i] += bytes;
+                        break;
+                    }
+                }
+            }
+            SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
+                    has_draft ? "draft model" : "MTP context",
+                    total / (1024.0 * 1024.0));
+        } catch (const std::exception & e) {
+            SRV_WRN("[spec] failed to measure %s memory: %s\n",
+                    has_draft ? "draft model" : "MTP context", e.what());
+        }
+    }
 
-            auto mparams_dft = common_model_params_to_llama(params_dft);
+    bool load_draft_context(common_params & params) {
+        const bool has_draft = params.speculative.has_dft();
+        const bool spec_mtp = params.speculative.has_spec_mtp();
 
-            model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
+        if (has_draft) {
+            draft_init_params params_dft;
+            init_draft_params(params, params_dft);
+
+            SRV_INF("loading draft model '%s'\n", params_dft.model_path.c_str());
+
+            params_dft.cparams.ctx_other = ctx_tgt;
+            
+            model_dft.reset(llama_model_load_from_file(params_dft.model_path.c_str(), params_dft.mparams));
             if (model_dft == nullptr) {
-                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model_path.c_str());
                 return false;
             }
 
-            auto cparams = common_context_params_to_llama(params_dft);
+            ctx_dft.reset(llama_init_from_model(model_dft.get(), params_dft.cparams));
 
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-
-            if (spec_mtp) {
-                cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-            }
-
-            // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-            //       the extra memory for small models is likely negligible?
-            cparams.n_rs_seq  = 0;
-            cparams.ctx_other = ctx_tgt;
-
-            ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
-
-            params_base.speculative.draft.ctx_tgt = ctx_tgt;
-            params_base.speculative.draft.ctx_dft = ctx_dft.get();
-        } else if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
-                             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) {
+            params.speculative.draft.ctx_tgt = ctx_tgt;
+            params.speculative.draft.ctx_dft = ctx_dft.get();
+        } else if (spec_mtp) {
             SRV_INF("creating MTP draft context against the target model '%s'\n",
-                    params_base.model.path.c_str());
+                    params.model.path.c_str());
 
-            auto cparams_mtp = common_context_params_to_llama(params_base);
-            cparams_mtp.ctx_type      = LLAMA_CONTEXT_TYPE_MTP;
-            cparams_mtp.type_k        = params_base.speculative.draft.cache_type_k;
-            cparams_mtp.type_v        = params_base.speculative.draft.cache_type_v;
-            cparams_mtp.n_rs_seq      = 0;
-            cparams_mtp.n_outputs_max = params_base.n_parallel;
-            cparams_mtp.ctx_other     = ctx_tgt;
+            draft_init_params params_dft;
+            init_draft_params(params, params_dft);
+            params_dft.cparams.ctx_other = ctx_tgt;
 
-            ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
+            ctx_dft.reset(llama_init_from_model(model_tgt, params_dft.cparams));
             if (ctx_dft == nullptr) {
                 SRV_ERR("%s", "failed to create MTP context\n");
                 return false;
             }
 
-            params_base.speculative.draft.ctx_tgt = ctx_tgt;
-            params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            params.speculative.draft.ctx_tgt = ctx_tgt;
+            params.speculative.draft.ctx_dft = ctx_dft.get();
         }
 
-        if (has_mmproj) {
-            if (!is_resume) {
-                mtmd_helper_log_set(common_log_default_callback, nullptr);
-            }
+        return true;
+    }
 
-            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
-            if (mctx == nullptr) {
-                SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
-                return false;
-            }
-            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
-
-            if (params_base.ctx_shift) {
-                params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
-            }
-
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
-            }
-        }
-
-        if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
-            if (params_base.ctx_shift) {
-                params_base.ctx_shift = false;
-                SRV_WRN("%s\n", "ctx_shift is not supported by this context, it will be disabled");
-            }
-
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by this context, it will be disabled");
-            }
-        }
-
-        if (llama_model_n_swa(model_tgt) == 0) {
-            if (params_base.swa_full) {
-                params_base.swa_full = false;
-                SRV_WRN("%s\n", "swa_full is not supported by this model, it will be disabled");
-            }
-        }
-
-        n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model_tgt);
+    void setup_runtime_state(common_params & params) {
+        n_swa = params.swa_full ? 0 : llama_model_n_swa(model_tgt);
 
         // Necessary similarity of prompt for slot selection
-        slot_prompt_similarity = params_base.slot_prompt_similarity;
+        slot_prompt_similarity = params.slot_prompt_similarity;
 
         // setup slots
-        SRV_INF("initializing slots, n_slots = %d\n", params_base.n_parallel);
+        SRV_INF("initializing slots, n_slots = %d\n", params.n_parallel);
 
         const int n_ctx_train = llama_model_n_ctx_train(model_tgt);
 
@@ -1047,14 +1004,14 @@ private:
         }
 
         // initialize slots
-        for (int i = 0; i < params_base.n_parallel; i++) {
+        for (int i = 0; i < params.n_parallel; i++) {
             slots.emplace_back();
         }
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                spec.reset(common_speculative_init(params.speculative, params.n_parallel));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
             }
@@ -1070,7 +1027,7 @@ private:
             ctx_dft.reset();
         }
 
-        for (int i = 0; i < params_base.n_parallel; i++) {
+        for (int i = 0; i < params.n_parallel; i++) {
             server_slot & slot = slots[i];
 
             slot.id      = i;
@@ -1113,43 +1070,114 @@ private:
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
-            batch = llama_batch_init(std::max(n_batch, params_base.n_parallel), 0, 1);
+            batch = llama_batch_init(std::max(n_batch, params.n_parallel), 0, 1);
         }
 
-        if (params_base.cache_ram_mib != 0) {
-            if (params_base.cache_ram_mib < 0) {
+        if (params.cache_ram_mib != 0) {
+            if (params.cache_ram_mib < 0) {
                 SRV_INF("prompt cache is enabled, size limit: %s\n", "no limit");
             } else {
-                SRV_INF("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+                SRV_INF("prompt cache is enabled, size limit: %d MiB\n", params.cache_ram_mib);
             }
             SRV_INF("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params.cache_ram_mib, n_ctx);
         } else {
             SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         SRV_INF("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
-        if (params_base.n_ctx_checkpoints > 0) {
+        if (params.n_ctx_checkpoints > 0) {
             SRV_INF("context checkpoints enabled, max = %d, min spacing = %d\n",
-                    params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+                    params.n_ctx_checkpoints, params.checkpoint_min_step);
         } else {
             SRV_INF("%s", "context checkpoints disabled\n");
         }
 
-        if (!params_base.model_alias.empty()) {
+        if (!params.model_alias.empty()) {
             // backward compat: use first alias as model name
-            model_name = *params_base.model_alias.begin();
-        } else if (!params_base.model.name.empty()) {
-            model_name = params_base.model.name;
+            model_name = *params.model_alias.begin();
+        } else if (!params.model.name.empty()) {
+            model_name = params.model.name;
         } else {
             // fallback: derive model name from file name
-            auto model_path = std::filesystem::path(params_base.model.path);
+            auto model_path = std::filesystem::path(params.model.path);
             model_name = model_path.filename().string();
         }
 
-        model_aliases = params_base.model_alias;
-        model_tags    = params_base.model_tags;
+        model_aliases = params.model_alias;
+        model_tags    = params.model_tags;
+    }
+
+    // load the model and initialize llama_context
+    // this may also be called to resume from sleeping state
+    bool load_model(common_params & params) {
+        bool is_resume = sleeping;
+
+        SRV_INF("loading model '%s'\n", params.model.path.c_str());
+
+        // save snapshot of original fit_params_target before any modifications
+        if (!is_resume) {
+            original_fit_target_snapshot = params.fit_params_target;
+        }
+
+        params_base = params;
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        std::string & mmproj_path = params_base.mmproj.path;
+        bool has_mmproj = !mmproj_path.empty();
+        const bool has_draft = params_base.speculative.has_dft();
+        const bool spec_mtp = params_base.speculative.has_spec_mtp();
+
+        mtmd_context_params mparams = build_mtmd_context_params(params_base);
+
+        // optionally reserve space for mmproj and/or draft / MTP context before fitting the target model
+        if (params_base.fit_params) {
+            if (has_mmproj) {
+                reserve_mmproj_memory_budget(params_base, mparams);
+            }
+            
+            if (has_draft || spec_mtp) {
+                reserve_draft_memory_budget(params_base);
+            }
+        }
+
+        llama_init = common_init_from_params(params_base);
+
+        model_tgt = llama_init->model();
+        ctx_tgt   = llama_init->context();
+
+        if (model_tgt == nullptr) {
+            SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
+            return false;
+        }
+
+        vocab = llama_model_get_vocab(model_tgt);
+
+        n_ctx = llama_n_ctx(ctx_tgt);
+
+        add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        if (has_draft || spec_mtp) {
+            if (!load_draft_context(params_base)) {
+                return false;
+            }
+        }
+
+        if (has_mmproj) {
+            if (!is_resume) {
+                mtmd_helper_log_set(common_log_default_callback, nullptr);
+            }
+
+            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            if (mctx == nullptr) {
+                SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+                return false;
+            }
+            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str()); 
+        }
+
+        setup_runtime_state(params_base);
 
         // propagate new defaults back to caller
         params = params_base;
@@ -1157,6 +1185,84 @@ private:
         if (!is_resume) {
             return init();
         }
+
+        return true;
+    }
+
+    bool reload_context(llama_context_params new_params_ctx) {
+        // 1. 3-way merge between:
+        // - original user-provided fit_params_target
+        // - existing params_base ("derived" mparams)
+        // - new params           (input cparams)
+        common_params new_params = params_base;
+        common_overlay_context_params(new_params, new_params_ctx);
+        new_params.fit_params_target = original_fit_target_snapshot;
+        new_params.n_outputs_max = server_n_outputs_max(new_params);
+
+        std::string & mmproj_path = new_params.mmproj.path;
+        bool has_mmproj = !mmproj_path.empty();
+        const bool has_draft = new_params.speculative.has_dft();
+        const bool spec_mtp = new_params.speculative.has_spec_mtp();
+
+        // 2. reinit mmproj params
+        mtmd_context_params mparams = build_mtmd_context_params(new_params);
+
+        // 3. rerun pre-load and main model fit
+        if (new_params.fit_params) {
+            if (has_mmproj) {
+                reserve_mmproj_memory_budget(new_params, mparams);
+            }
+            
+            if (has_draft || spec_mtp) {
+                reserve_draft_memory_budget(new_params);
+            }
+
+            // apply main model fit early. if it fails, we abort before tearing down ctx
+            if (!common_fit_from_params(new_params)) {
+                SRV_ERR("%s\n", "fit failed for new params, aborting");
+                return false;
+            }
+        }
+
+        // 4. tear down existing context
+        destroy_context();
+
+        // 5. reinit context
+        llama_context * new_ctx_tgt = llama_init->reinit_context(new_params);
+        if (new_ctx_tgt == nullptr) {
+            SRV_ERR("%s\n", "failed to reinit context");
+            return false;
+        }
+        ctx_tgt = new_ctx_tgt;
+
+        vocab = llama_model_get_vocab(model_tgt);
+
+        n_ctx = llama_n_ctx(ctx_tgt);
+
+        add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        // 6. load draft/spec model and context
+        if (has_draft || spec_mtp) {
+            if (!load_draft_context(new_params)) {
+                return false;
+            }
+        }
+
+        // 7. load mmproj
+        if (has_mmproj) {
+            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            if (mctx == nullptr) {
+                SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+                return false;
+            }
+            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str()); 
+        }
+
+        // 8. remaining server state setup
+        setup_runtime_state(new_params);
+
+        // persist new defaults
+        params_base = new_params;
 
         return true;
     }
@@ -2339,6 +2445,36 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_REINIT_CONTEXT:
+                {
+                    // If any slot is busy, defer this task for later
+                    bool deferred = false;
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SRV_DBG("slot %d is busy, defer task, id_task = %d\n", slot.id, task.id);
+                            queue_tasks.defer(std::move(task));
+                            deferred = true;
+                            break;
+                        }
+                    }
+                    if (deferred) break;
+                 
+                    auto res = std::make_unique<server_task_result_reinit_context>();
+                    res->id = task.id;
+
+                    common_params new_params = common_params_from_json(params_base, task.reinit_body);
+                    llama_context_params new_ctx_params = common_context_params_to_llama(new_params);
+
+                    if (!reload_context(new_ctx_params)) {
+                        res->success = false;
+                        res->message = "Unable to reinitialize context";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    
+                    res->success = true;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
@@ -4727,6 +4863,41 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_context = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        // Parse the JSON body
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception & err) {
+            res->error(format_error_response(std::string("Failed to parse JSON: ") + err.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        {
+            server_task task(SERVER_TASK_TYPE_REINIT_CONTEXT);
+            task.id = res->rd.get_new_id();
+            task.reinit_body = std::move(body);
+            res->rd.post_task(std::move(task), true); // high-priority task
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            // connection was closed
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
         res->ok(result->to_json());
         return res;
     };
