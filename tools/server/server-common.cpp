@@ -1,3 +1,4 @@
+#include "llama.h"
 #include "common.h"
 #include "download.h"
 #include "log.h"
@@ -12,6 +13,7 @@
 #include <random>
 #include <sstream>
 #include <fstream>
+#include <unordered_map>
 
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
@@ -1579,4 +1581,120 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+
+static llama_rope_scaling_type parse_rope_scaling_type(const std::string & s, llama_rope_scaling_type fallback) {
+    static const std::unordered_map<std::string, llama_rope_scaling_type> map = {
+        {"none",     LLAMA_ROPE_SCALING_TYPE_NONE},
+        {"linear",   LLAMA_ROPE_SCALING_TYPE_LINEAR},
+        {"yarn",     LLAMA_ROPE_SCALING_TYPE_YARN},
+        {"longrope", LLAMA_ROPE_SCALING_TYPE_LONGROPE},
+    };
+    auto it = map.find(s);
+    return it == map.end() ? fallback : it->second;
+}
+
+static enum llama_pooling_type parse_pooling_type(const std::string & s, enum llama_pooling_type fallback) {
+    static const std::unordered_map<std::string, enum llama_pooling_type> map = {
+        {"none", LLAMA_POOLING_TYPE_NONE},
+        {"mean", LLAMA_POOLING_TYPE_MEAN},
+        {"cls",  LLAMA_POOLING_TYPE_CLS},
+        {"last", LLAMA_POOLING_TYPE_LAST},
+        {"rank", LLAMA_POOLING_TYPE_RANK},
+    };
+    auto it = map.find(s);
+    return it == map.end() ? fallback : it->second;
+}
+
+static llama_attention_type parse_attention_type(const std::string & s, llama_attention_type fallback) {
+    static const std::unordered_map<std::string, llama_attention_type> map = {
+        {"causal",     LLAMA_ATTENTION_TYPE_CAUSAL},
+        {"non-causal", LLAMA_ATTENTION_TYPE_NON_CAUSAL},
+    };
+    auto it = map.find(s);
+    return it == map.end() ? fallback : it->second;
+}
+
+static llama_flash_attn_type parse_flash_attn_type(const std::string & s, llama_flash_attn_type fallback) {
+    static const std::unordered_map<std::string, llama_flash_attn_type> map = {
+        {"enabled",  LLAMA_FLASH_ATTN_TYPE_ENABLED},
+        {"disabled", LLAMA_FLASH_ATTN_TYPE_DISABLED},
+        {"auto",     LLAMA_FLASH_ATTN_TYPE_AUTO},
+    };
+    auto it = map.find(s);
+    return it == map.end() ? fallback : it->second;
+}
+
+static ggml_type parse_ggml_cache_type(const std::string & s, ggml_type fallback) {
+    static const std::unordered_map<std::string, ggml_type> map = {
+        {"f32",    GGML_TYPE_F32},
+        {"f16",    GGML_TYPE_F16},
+        {"bf16",   GGML_TYPE_BF16},
+        {"q8_0",   GGML_TYPE_Q8_0},
+        {"q4_0",   GGML_TYPE_Q4_0},
+        {"q4_1",   GGML_TYPE_Q4_1},
+        {"iq4_nl", GGML_TYPE_IQ4_NL},
+        {"q5_0",   GGML_TYPE_Q5_0},
+        {"q5_1",   GGML_TYPE_Q5_1},
+    };
+    auto it = map.find(s);
+    return it == map.end() ? fallback : it->second;
+}
+
+common_params common_params_from_json(const common_params & params_base, const json & body) {
+    common_params params = params_base;
+
+    // Context parameters (from common_context_params_to_llama)
+    params.n_ctx         = json_value(body, "n_ctx", params.n_ctx);
+    params.n_parallel    = json_value(body, "n_parallel", params.n_parallel);
+    params.n_batch       = json_value(body, "n_batch", params.n_batch);
+    params.n_ubatch      = json_value(body, "n_ubatch", params.n_ubatch);
+
+    // CPU parameters
+    params.cpuparams.n_threads       = json_value(body, "n_threads", params.cpuparams.n_threads);
+    params.cpuparams_batch.n_threads = json_value(body, "n_threads_batch", params.cpuparams_batch.n_threads);
+
+    // RoPE parameters
+    if (body.contains("rope_scaling_type")) {
+        params.rope_scaling_type = parse_rope_scaling_type(body.at("rope_scaling_type").get<std::string>(), params.rope_scaling_type);
+    }
+    params.rope_freq_base    = json_value(body, "rope_freq_base", params.rope_freq_base);
+    params.rope_freq_scale   = json_value(body, "rope_freq_scale", params.rope_freq_scale);
+
+    // YaRN parameters
+    params.yarn_ext_factor  = json_value(body, "yarn_ext_factor", params.yarn_ext_factor);
+    params.yarn_attn_factor = json_value(body, "yarn_attn_factor", params.yarn_attn_factor);
+    params.yarn_beta_fast   = json_value(body, "yarn_beta_fast", params.yarn_beta_fast);
+    params.yarn_beta_slow   = json_value(body, "yarn_beta_slow", params.yarn_beta_slow);
+    params.yarn_orig_ctx    = json_value(body, "yarn_orig_ctx", params.yarn_orig_ctx);
+
+    // Pooling and attention parameters
+    if (body.contains("pooling_type")) {
+        params.pooling_type = parse_pooling_type(body.at("pooling_type").get<std::string>(), params.pooling_type);
+    }
+    if (body.contains("attention_type")) {
+        params.attention_type = parse_attention_type(body.at("attention_type").get<std::string>(), params.attention_type);
+    }
+    if (body.contains("flash_attn_type")) {
+        params.flash_attn_type = parse_flash_attn_type(body.at("flash_attn_type").get<std::string>(), params.flash_attn_type);
+    }
+
+    // KV cache parameters
+    params.no_kv_offload = !json_value(body, "offload_kqv", !params.no_kv_offload);
+    params.swa_full      = json_value(body, "swa_full", params.swa_full);
+    params.kv_unified    = json_value(body, "kv_unified", params.kv_unified);
+
+    // Cache type parameters (GGML_TYPE enums - using string to type mapping)
+    if (body.contains("cache_type_k")) {
+        params.cache_type_k = parse_ggml_cache_type(body.at("cache_type_k").get<std::string>(), params.cache_type_k);
+    }
+    if (body.contains("cache_type_v")) {
+        params.cache_type_v = parse_ggml_cache_type(body.at("cache_type_v").get<std::string>(), params.cache_type_v);
+    }
+
+    // Performance parameters
+    params.no_perf       = json_value(body, "no_perf", params.no_perf);
+    params.no_op_offload = !json_value(body, "op_offload", !params.no_op_offload);
+
+    return params;
 }

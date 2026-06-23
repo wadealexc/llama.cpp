@@ -2447,6 +2447,36 @@ private:
                     res->n_erased = n_erased;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_REINIT_CONTEXT:
+                {
+                    // If any slot is busy, defer this task for later
+                    bool deferred = false;
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SRV_DBG("slot %d is busy, defer task, id_task = %d\n", slot.id, task.id);
+                            queue_tasks.defer(std::move(task));
+                            deferred = true;
+                            break;
+                        }
+                    }
+                    if (deferred) break;
+                 
+                    auto res = std::make_unique<server_task_result_reinit_context>();
+                    res->id = task.id;
+
+                    common_params new_params = common_params_from_json(params_base, task.reinit_body);
+                    llama_context_params new_ctx_params = common_context_params_to_llama(new_params);
+
+                    if (!reload_context(new_ctx_params)) {
+                        res->success = false;
+                        res->message = "Unable to reinitialize context";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    
+                    res->success = true;
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
                     // TODO @ngxson : make lora_adapters a dedicated member of server_context
@@ -4833,6 +4863,41 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_context = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        // Parse the JSON body
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception & err) {
+            res->error(format_error_response(std::string("Failed to parse JSON: ") + err.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        {
+            server_task task(SERVER_TASK_TYPE_REINIT_CONTEXT);
+            task.id = res->rd.get_new_id();
+            task.reinit_body = std::move(body);
+            res->rd.post_task(std::move(task), true); // high-priority task
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            // connection was closed
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
         res->ok(result->to_json());
         return res;
     };

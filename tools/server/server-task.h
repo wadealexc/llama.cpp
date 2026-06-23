@@ -27,6 +27,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_ERASE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
+    SERVER_TASK_TYPE_REINIT_CONTEXT,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -165,6 +166,9 @@ struct server_task {
         std::string filepath;
     };
     slot_action slot_action;
+
+    // used by SERVER_TASK_TYPE_REINIT_CONTEXT
+    json reinit_body;
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
@@ -568,6 +572,8 @@ struct server_task_result_control : server_task_result {
         return out;
     }
 };
+
+using server_task_result_reinit_context = server_task_result_control;
 
 struct server_task_result_get_lora : server_task_result {
     struct lora {
