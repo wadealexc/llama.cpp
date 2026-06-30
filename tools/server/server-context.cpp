@@ -890,6 +890,9 @@ private:
 
     common_params params_base;
 
+    // snapshot of original fit_params_target before any modifications
+    std::vector<size_t> original_fit_target_snapshot;
+
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
@@ -950,6 +953,20 @@ private:
 
         ctx_tgt = nullptr;
         model_tgt = nullptr;
+
+        mtmd_free(mctx);
+        mctx = nullptr;
+    }
+
+    void destroy_context() {
+        slots.clear();
+        prompt_cache.reset();
+        
+        spec.reset();
+        spec_init.reset();
+
+        ctx_dft   = nullptr;
+        model_dft = nullptr;
 
         mtmd_free(mctx);
         mctx = nullptr;
@@ -1283,6 +1300,11 @@ private:
 
         const bool is_resume = sleeping;
 
+        // save snapshot of original fit_params_target before any modifications
+        if (!is_resume) {
+            original_fit_target_snapshot = params.fit_params_target;
+        }
+
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
@@ -1421,6 +1443,160 @@ private:
         if (!is_resume) {
             return init();
         }
+
+        if (callback_state) {
+            callback_state(SERVER_STATE_READY, {});
+        }
+
+        return true;
+    }
+
+    bool reload_context(common_params & params) {
+        load_progress_data load_progress_text  (this, "text_model");
+        load_progress_data load_progress_mmproj(this, "mmproj_model");
+        load_progress_data load_progress_spec  (this, "spec_model");
+        
+        // get only llama_context_params from input; other params are ignored
+        auto new_ctx_params = common_context_params_to_llama(params);
+
+        // 1. 3-way merge between:
+        // - original fit_params_target
+        // - existing params_base ("locked" mparams after load_model fit)
+        // - new context params
+        common_overlay_context_params(params_base, new_ctx_params);
+        params_base.fit_params_target = original_fit_target_snapshot;
+        params_base.n_outputs_max     = server_n_outputs_max(params_base);
+
+        const bool has_mmproj = !params_base.mmproj.path.empty();
+        const bool has_draft = params_base.speculative.has_dft();
+        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool has_spec = has_draft || spec_mtp;
+
+        if (callback_state) {
+            std::vector<std::string> stages = {"text_model"};
+            if (has_spec) {
+                stages.push_back("spec_model");
+            }
+            if (has_mmproj) {
+                stages.push_back("mmproj_model");
+            }
+            load_progress_text.stages   = stages;
+            load_progress_mmproj.stages = stages;
+            load_progress_spec.stages   = stages;
+
+            // trigger 0% progress
+            load_progress_callback(0.0f, &load_progress_text);
+        }
+
+        // 2. reinit mmproj params
+        std::string & mmproj_path = params_base.mmproj.path;
+        mtmd_context_params mparams = build_mtmd_context_params(params_base);
+        {
+            // attach a progress callback (mmproj)
+            mparams.progress_callback           = load_progress_callback;
+            mparams.progress_callback_user_data = &load_progress_mmproj;
+        }
+
+        // 3. rerun pre-load fit
+        if (params_base.fit_params) {
+            if (has_mmproj) {
+                reserve_mmproj_memory_budget(params_base, mparams);
+            }
+            
+            if (has_spec) {
+                reserve_speculative_memory_budget(params_base);
+            }
+        }
+
+        {
+            // attach a progress callback (main model)
+            params_base.load_progress_callback = load_progress_callback;
+            params_base.load_progress_callback_user_data = &load_progress_text;
+        }
+
+        // 4. tear down existing context
+        destroy_context();
+
+        // 5. reinit context
+        llama_init->reinit_context(params_base);
+
+        ctx_tgt = llama_init->context();
+
+        if (ctx_tgt == nullptr) {
+            SRV_ERR("%s\n", "failed to reinit context");
+            return false;
+        }
+
+        vocab = llama_model_get_vocab(model_tgt);
+
+        n_ctx = llama_n_ctx(ctx_tgt);
+
+        add_bos_token = llama_vocab_get_add_bos(vocab);
+
+        // 6. load draft/spec model and context
+        if (has_spec) {
+            // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
+            load_progress_callback(0.0f, &load_progress_spec);
+            load_progress_spec.t_last_load_progress_ms = 0;  // reset so internal cbs aren't delayed
+
+            {
+                common_params params_dft = common_base_params_to_speculative(params_base);
+                // progress callback
+                params_dft.load_progress_callback           = load_progress_callback;
+                params_dft.load_progress_callback_user_data = &load_progress_spec;
+
+                spec_init = common_init_speculative_from_params(params_dft, model_tgt, ctx_tgt);
+                model_dft = spec_init->model();
+                ctx_dft   = spec_init->context();
+
+                if (has_draft && model_dft == nullptr) {
+                    SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                    return false;
+                }
+
+                if (ctx_dft == nullptr) {
+                    SRV_ERR("%s", "failed to create MTP context\n");
+                    return false;
+                }
+
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft;
+            }
+
+            load_progress_callback(1.0f, &load_progress_spec);
+        }
+
+        // 7. load mmproj
+        if (has_mmproj) {
+            if (callback_state) {
+                callback_state(SERVER_STATE_LOADING, {{"stage", "mmproj_model"}});
+            }
+
+            mctx = mtmd_init_from_file(mmproj_path.c_str(), model_tgt, mparams);
+            if (mctx == nullptr) {
+                SRV_ERR("failed to load multimodal model, '%s'\n", mmproj_path.c_str());
+                return false;
+            }
+            SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+
+            if (params_base.ctx_shift) {
+                params_base.ctx_shift = false;
+                SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
+            }
+
+            if (params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
+            }
+        }
+
+        // 8. remaining server state setup
+        setup_runtime_state(params_base);
+
+        // propagate new defaults back to caller
+        params = params_base;
 
         if (callback_state) {
             callback_state(SERVER_STATE_READY, {});

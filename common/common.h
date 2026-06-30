@@ -914,6 +914,9 @@ struct llama_context_params   common_context_params_to_llama(const common_params
 // would involve refactoring common_params to provide mutable views of
 // llama_model_params/llama_context_params.
 bool common_fit_from_params_base(struct common_params & params);
+// overlay context-specific params from ctx onto params
+void common_overlay_context_params(common_params & params, llama_context_params ctx);
+
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
