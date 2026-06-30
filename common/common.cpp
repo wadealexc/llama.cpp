@@ -1195,19 +1195,12 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
-
+    
     if (params.fit_params) {
-        COM_TRC("%s", "fitting params to device memory ...\n");
-        COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        common_fit_from_params_base(params);
     }
+
+    auto mparams = common_model_params_to_llama(params);
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
@@ -1453,20 +1446,8 @@ llama_context * common_init_result::reinit_context(common_params & params) {
     // reset samplers, and context
     reset_context();
 
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
-
-    // NOTE: common_fit_params modifies mparams and cparams. We need those modified values
-    // in init_context_inner.
     if (params.fit_params) {
-        LOG_INF("%s: fitting params to device memory ...\n", __func__);
-        LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        common_fit_from_params_base(params);
     }
 
     if (!init_context_inner(params)) {
@@ -1664,6 +1645,39 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     return cparams;
+}
+
+bool common_fit_from_params_base(common_params & params) {
+    LOG_INF("%s: fitting params to device memory ...\n", __func__);
+    LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
+
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+
+    auto status = common_fit_params(
+        params.model.path.c_str(), &mparams, &cparams,
+        params.tensor_split,
+        params.tensor_buft_overrides.data(),
+        params.fit_params_target.data(),
+        params.fit_params_min_ctx,
+        params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    
+    // common_fit_params modifies (via mparams/cparams):
+    // - n_gpu_layers
+    // - tensor_split
+    // - tensor_buft_overrides
+    // - n_ctx
+    // - fit_params_target
+    //
+    // of these, only n_ctx and n_gpu_layers need to be explicitly persisted. the rest
+    // are already owned by params.
+    if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        params.n_ctx        = cparams.n_ctx;
+        params.n_gpu_layers = mparams.n_gpu_layers;
+        return true;
+    }
+    
+    return false;
 }
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {
