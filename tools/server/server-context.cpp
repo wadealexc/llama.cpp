@@ -1455,15 +1455,12 @@ private:
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_mmproj(this, "mmproj_model");
         load_progress_data load_progress_spec  (this, "spec_model");
-        
-        // get only llama_context_params from input; other params are ignored
-        auto new_ctx_params = common_context_params_to_llama(params);
 
         // 1. 3-way merge between:
         // - original fit_params_target
         // - existing params_base ("locked" mparams after load_model fit)
         // - new context params
-        common_overlay_context_params(params_base, new_ctx_params);
+        params_base = params;
         params_base.fit_params_target = original_fit_target_snapshot;
         params_base.n_outputs_max     = server_n_outputs_max(params_base);
 
@@ -1594,9 +1591,6 @@ private:
 
         // 8. remaining server state setup
         setup_runtime_state(params_base);
-
-        // propagate new defaults back to caller
-        params = params_base;
 
         if (callback_state) {
             callback_state(SERVER_STATE_READY, {});
@@ -2853,6 +2847,39 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_RELOAD_CONTEXT:
+                {
+                    // If any slot is busy, defer this task for later
+                    bool deferred = false;
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SRV_DBG("slot %d is busy, defer task, id_task = %d\n", slot.id, task.id);
+                            queue_tasks.defer(std::move(task));
+                            deferred = true;
+                            break;
+                        }
+                    }
+                    if (deferred) break;
+                 
+                    auto res = std::make_unique<server_task_result_reload_context>();
+                    res->id = task.id;
+
+                    // parse context params from json (unset fields inherit params_base as defaults)
+                    auto new_params = server_schema::eval_llama_ctx_schema(
+                        params_base,
+                        task.reload_body
+                    );
+
+                    if (!reload_context(new_params)) {
+                        res->success = false;
+                        res->message = "Unable to reinitialize context";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    
+                    res->success = true;
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -5261,6 +5288,32 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_context = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        {
+            server_task task(SERVER_TASK_TYPE_RELOAD_CONTEXT);
+            task.id = res->rd.get_new_id();
+            task.reload_body = json::parse(req.body);
+            res->rd.post_task(std::move(task), true); // high-priority task
+        }
+
+        auto result = res->rd.next(req.should_stop);
+        if (!result) {
+            // connection was closed
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
         res->ok(result->to_json());
         return res;
     };

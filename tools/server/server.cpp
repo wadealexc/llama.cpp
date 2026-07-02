@@ -243,6 +243,8 @@ int llama_server(int argc, char ** argv) {
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    // Reload context
+    ctx_http.post("/context", ex_wrapper(routes.post_context));
 
     // resumable streaming, the conversation_id is the session identity end to end. router and
     // child wire different handlers under the same paths: a child binds the local g_stream_sessions

@@ -1,5 +1,6 @@
 #include "server-schema.h"
 
+#include "common.h"
 #include "json-schema-to-grammar.h"
 
 namespace server_schema {
@@ -78,7 +79,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_json("response_fields"))
         ->set_desc("A list of response fields to return. Missing fields are omitted without error. Fields with a slash are unnested (e.g. generation_settings/n_predict moves n_predict to the root)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
-            ctx.params.response_fields = json_value(data, "response_fields", std::vector<std::string>());
+            ctx.params().response_fields = json_value(data, "response_fields", std::vector<std::string>());
         }));
 
 
@@ -143,7 +144,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Set the DRY repetition penalty base value (must be >= 1.0, any values < 1.0 will be replaced with the default value)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             float v = data.at("dry_base").get<float>();
-            ctx.params.sampling.dry_base = (v < 1.0f) ? params_base.sampling.dry_base : v;
+            ctx.params().sampling.dry_base = (v < 1.0f) ? params_base.sampling.dry_base : v;
         }));
 
     add((new field_num("dry_allowed_length", params.sampling.dry_allowed_length))
@@ -212,7 +213,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_str("speculative.type"))
         ->set_desc("Speculative decoding method (for debugging and research purposes)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
-            ctx.params.speculative.types = { common_speculative_type_from_name(data.at("speculative.type").get<std::string>()) };
+            ctx.params().speculative.types = { common_speculative_type_from_name(data.at("speculative.type").get<std::string>()) };
         }));
 
     add((new field_num("speculative.ngram_size_n", params.speculative.ngram_simple.size_n))
@@ -232,7 +233,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             if (!lora.is_array()) {
                 throw std::runtime_error("Error: 'lora' must be an array of objects with 'id' and 'scale' fields");
             }
-            ctx.params.lora = parse_lora_request(lora);
+            ctx.params().lora = parse_lora_request(lora);
         }));
 
     // sequence breakers for DRY
@@ -241,8 +242,8 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_json("dry_sequence_breakers"))
         ->set_desc("Specify an array of sequence breakers for DRY sampling. Only a JSON array of strings is accepted")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
-            ctx.params.sampling.dry_sequence_breakers = json_value(data, "dry_sequence_breakers", std::vector<std::string>());
-            if (ctx.params.sampling.dry_sequence_breakers.empty()) {
+            ctx.params().sampling.dry_sequence_breakers = json_value(data, "dry_sequence_breakers", std::vector<std::string>());
+            if (ctx.params().sampling.dry_sequence_breakers.empty()) {
                 throw std::runtime_error("Error: dry_sequence_breakers must be a non-empty array of strings");
             }
         }));
@@ -252,7 +253,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->add_alias("grammar")
         ->set_desc("Set a JSON schema (json_schema) or GBNF grammar string (grammar) for constrained generation. json_schema takes precedence if both are provided")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
-            auto & params = ctx.params;
+            auto & params = ctx.params();
             if (data.contains("json_schema") && !data.contains("grammar")) {
                 try {
                     auto schema                  = json_value(data, "json_schema", json::object());
@@ -290,24 +291,24 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_json("chat_format"))
         ->set_desc("Chat format used internally by the server")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
-            ctx.params.chat_parser_params.format = static_cast<common_chat_format>(data.at("chat_format").get<int>());
-            SRV_TRC("chat format: %s\n", common_chat_format_name(ctx.params.chat_parser_params.format));
+            ctx.params().chat_parser_params.format = static_cast<common_chat_format>(data.at("chat_format").get<int>());
+            SRV_TRC("chat format: %s\n", common_chat_format_name(ctx.params().chat_parser_params.format));
         }));
 
     add((new field_str("reasoning_format"))
         ->set_desc("Reasoning format for chain-of-thought models")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             auto reasoning_format = common_reasoning_format_from_name(data.at("reasoning_format").get<std::string>());
-            ctx.params.chat_parser_params.reasoning_format = reasoning_format;
-            ctx.params.chat_parser_params.reasoning_in_content = ctx.params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
+            ctx.params().chat_parser_params.reasoning_format = reasoning_format;
+            ctx.params().chat_parser_params.reasoning_in_content = ctx.params().stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
         }));
 
     add((new field_str("generation_prompt"))
         ->set_desc("Generation prompt appended to the chat template output")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             std::string s = data.at("generation_prompt").get<std::string>();
-            ctx.params.chat_parser_params.generation_prompt = s;
-            ctx.params.sampling.generation_prompt = s;
+            ctx.params().chat_parser_params.generation_prompt = s;
+            ctx.params().sampling.generation_prompt = s;
         }));
 
     add((new field_bool("parse_tool_calls", params.chat_parser_params.parse_tool_calls))
@@ -316,14 +317,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_str("chat_parser"))
         ->set_desc("Chat parser configuration string")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
-            ctx.params.chat_parser_params.parser.load(data.at("chat_parser").get<std::string>());
+            ctx.params().chat_parser_params.parser.load(data.at("chat_parser").get<std::string>());
         }));
 
     add((new field_json("continue_final_message"))
         ->set_desc("Whether to continue the final message of the chat template")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             auto continuation = common_chat_continuation_parse(data.at("continue_final_message"));
-            ctx.params.chat_parser_params.is_continuation = continuation != COMMON_CHAT_CONTINUATION_NONE;
+            ctx.params().chat_parser_params.is_continuation = continuation != COMMON_CHAT_CONTINUATION_NONE;
         }));
 
     add((new field_bool("echo", params.chat_parser_params.echo))
@@ -340,7 +341,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             for (const auto & t : data.at("preserved_tokens")) {
                 auto ids = common_tokenize(ctx.vocab, t.get<std::string>(), false, true);
                 if (ids.size() == 1) {
-                    ctx.params.sampling.preserved_tokens.insert(ids[0]);
+                    ctx.params().sampling.preserved_tokens.insert(ids[0]);
                 }
             }
         }));
@@ -356,22 +357,22 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                     auto ids = common_tokenize(ctx.vocab, word, false, true);
                     if (ids.size() == 1) {
                         auto token = ids[0];
-                        if (std::find(ctx.params.sampling.preserved_tokens.begin(), ctx.params.sampling.preserved_tokens.end(), (llama_token) token) == ctx.params.sampling.preserved_tokens.end()) {
+                        if (std::find(ctx.params().sampling.preserved_tokens.begin(), ctx.params().sampling.preserved_tokens.end(), (llama_token) token) == ctx.params().sampling.preserved_tokens.end()) {
                             throw std::runtime_error("Grammar trigger word should be marked as preserved token: " + word);
                         }
                         common_grammar_trigger trigger;
                         trigger.type  = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN;
                         trigger.value = word;
                         trigger.token = token;
-                        ctx.params.sampling.grammar_triggers.push_back(std::move(trigger));
+                        ctx.params().sampling.grammar_triggers.push_back(std::move(trigger));
                     } else {
-                        ctx.params.sampling.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_WORD, word});
+                        ctx.params().sampling.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_WORD, word});
                     }
                 } else {
-                    ctx.params.sampling.grammar_triggers.emplace_back(std::move(ct.value));
+                    ctx.params().sampling.grammar_triggers.emplace_back(std::move(ct.value));
                 }
             }
-            if (ctx.params.sampling.grammar_lazy && ctx.params.sampling.grammar_triggers.empty()) {
+            if (ctx.params().sampling.grammar_lazy && ctx.params().sampling.grammar_triggers.empty()) {
                 throw std::runtime_error("Error: no triggers set for lazy grammar!");
             }
         }));
@@ -387,7 +388,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Token string marking the start of the reasoning budget section")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             GGML_ASSERT(ctx.vocab != nullptr);
-            ctx.params.sampling.reasoning_budget_start = common_tokenize(ctx.vocab, data.at("reasoning_budget_start_tag").get<std::string>(), false, true);
+            ctx.params().sampling.reasoning_budget_start = common_tokenize(ctx.vocab, data.at("reasoning_budget_start_tag").get<std::string>(), false, true);
         }));
 
     add((new field_str("reasoning_budget_end_tag"))
@@ -395,7 +396,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             GGML_ASSERT(ctx.vocab != nullptr);
             std::string end_tag = data.at("reasoning_budget_end_tag").get<std::string>();
-            ctx.params.sampling.reasoning_budget_end = common_tokenize(ctx.vocab, end_tag, false, true);
+            ctx.params().sampling.reasoning_budget_end = common_tokenize(ctx.vocab, end_tag, false, true);
         }));
 
     add((new field_str("reasoning_budget_message"))
@@ -404,14 +405,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             GGML_ASSERT(ctx.vocab != nullptr);
             std::string end_tag = json_value(data, "reasoning_budget_end_tag", std::string());
             std::string message = data.at("reasoning_budget_message").get<std::string>();
-            ctx.params.sampling.reasoning_budget_forced = common_tokenize(ctx.vocab, message + end_tag, false, true);
+            ctx.params().sampling.reasoning_budget_forced = common_tokenize(ctx.vocab, message + end_tag, false, true);
         }));
 
     add((new field_json("logit_bias"))
         ->set_desc("Modify the likelihood of specific tokens. Accepts an array of [token, bias] pairs or an object mapping token to bias. Use false as bias to ban a token")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             GGML_ASSERT(ctx.vocab != nullptr);
-            ctx.params.sampling.logit_bias.clear();
+            ctx.params().sampling.logit_bias.clear();
             const auto & logit_bias = data.at("logit_bias");
             const int n_vocab = llama_vocab_n_tokens(ctx.vocab);
             auto parse_bias = [](const json & v, float & bias) -> bool {
@@ -426,10 +427,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                     if (!parse_bias(el[1], bias)) continue;
                     if (el[0].is_number_integer()) {
                         llama_token tok = el[0].get<llama_token>();
-                        if (tok >= 0 && tok < n_vocab) ctx.params.sampling.logit_bias.push_back({tok, bias});
+                        if (tok >= 0 && tok < n_vocab) ctx.params().sampling.logit_bias.push_back({tok, bias});
                     } else if (el[0].is_string()) {
                         for (auto tok : common_tokenize(ctx.vocab, el[0].get<std::string>(), false))
-                            ctx.params.sampling.logit_bias.push_back({tok, bias});
+                            ctx.params().sampling.logit_bias.push_back({tok, bias});
                     }
                 }
             } else if (logit_bias.is_object()) {
@@ -439,10 +440,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                     char * end;
                     llama_token tok = strtol(el.key().c_str(), &end, 10);
                     if (*end == 0) {
-                        if (tok >= 0 && tok < n_vocab) ctx.params.sampling.logit_bias.push_back({tok, bias});
+                        if (tok >= 0 && tok < n_vocab) ctx.params().sampling.logit_bias.push_back({tok, bias});
                     } else {
                         for (auto t : common_tokenize(ctx.vocab, el.key(), false))
-                            ctx.params.sampling.logit_bias.push_back({t, bias});
+                            ctx.params().sampling.logit_bias.push_back({t, bias});
                     }
                 }
             }
@@ -452,10 +453,10 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_desc("Ignore the end-of-sequence token and continue generating")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             GGML_ASSERT(ctx.logit_bias_eog != nullptr);
-            ctx.params.sampling.ignore_eos = data.at("ignore_eos").get<bool>();
-            if (ctx.params.sampling.ignore_eos && ctx.logit_bias_eog) {
-                ctx.params.sampling.logit_bias.insert(
-                    ctx.params.sampling.logit_bias.end(),
+            ctx.params().sampling.ignore_eos = data.at("ignore_eos").get<bool>();
+            if (ctx.params().sampling.ignore_eos && ctx.logit_bias_eog) {
+                ctx.params().sampling.logit_bias.insert(
+                    ctx.params().sampling.logit_bias.end(),
                     ctx.logit_bias_eog->begin(), ctx.logit_bias_eog->end());
             }
         }));
@@ -463,18 +464,18 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_json("stop"))
         ->set_desc("Specify stopping strings. Generation stops when one is produced, and the string is not included in the output")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
-            ctx.params.antiprompt.clear();
+            ctx.params().antiprompt.clear();
             const auto & stop = data.at("stop");
             if (stop.is_array()) {
                 for (const auto & word : stop) {
-                    if (!word.empty()) ctx.params.antiprompt.push_back(word);
+                    if (!word.empty()) ctx.params().antiprompt.push_back(word);
                 }
             } else if (stop.is_string()) {
-                ctx.params.antiprompt.push_back(stop.get<std::string>());
+                ctx.params().antiprompt.push_back(stop.get<std::string>());
             }
             // fall back to CLI defaults if the request provided no effective stop strings
-            if (ctx.params.antiprompt.empty()) {
-                ctx.params.antiprompt = params_base.antiprompt;
+            if (ctx.params().antiprompt.empty()) {
+                ctx.params().antiprompt = params_base.antiprompt;
             }
         }));
 
@@ -483,9 +484,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             const auto & samplers = data.at("samplers");
             if (samplers.is_array()) {
-                ctx.params.sampling.samplers = common_sampler_types_from_names(samplers);
+                ctx.params().sampling.samplers = common_sampler_types_from_names(samplers);
             } else if (samplers.is_string()) {
-                ctx.params.sampling.samplers = common_sampler_types_from_chars(samplers.get<std::string>());
+                ctx.params().sampling.samplers = common_sampler_types_from_chars(samplers.get<std::string>());
             }
         }));
 
@@ -555,6 +556,240 @@ task_params eval_llama_cmpl_schema(
 
     return params;
 }
+
+//
+// llama.cpp-specific context schema
+//
+
+// KV cache types accepted via the "cache_type_k" / "cache_type_v" JSON fields.
+// Mirrors the (static) CLI parser in common/arg.cpp.
+static const std::vector<ggml_type> ctx_kv_cache_types = {
+    GGML_TYPE_F32,
+    GGML_TYPE_F16,
+    GGML_TYPE_BF16,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_IQ4_NL,
+    GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1,
+};
+
+static ggml_type ctx_kv_cache_type_from_str(const std::string & s) {
+    for (const auto & type : ctx_kv_cache_types) {
+        if (ggml_type_name(type) == s) {
+            return type;
+        }
+    }
+    std::string allowed;
+    for (const auto & type : ctx_kv_cache_types) {
+        allowed += ggml_type_name(type);
+        allowed += (&type == &ctx_kv_cache_types.back() ? "" : ", ");
+    }
+    throw std::invalid_argument("unsupported cache type '" + s + "', allowed values: " + allowed);
+}
+
+static enum llama_rope_scaling_type ctx_rope_scaling_type_from_str(const std::string & s) {
+    /**/ if (s == "unspecified") { return LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED; }
+    else if (s == "none")      { return LLAMA_ROPE_SCALING_TYPE_NONE; }
+    else if (s == "linear")    { return LLAMA_ROPE_SCALING_TYPE_LINEAR; }
+    else if (s == "yarn")      { return LLAMA_ROPE_SCALING_TYPE_YARN; }
+    else if (s == "longrope")  { return LLAMA_ROPE_SCALING_TYPE_LONGROPE; }
+    throw std::invalid_argument("unsupported rope_scaling_type '" + s + "', allowed values: unspecified, none, linear, yarn, longrope");
+}
+
+static enum llama_pooling_type ctx_pooling_type_from_str(const std::string & s) {
+    /**/ if (s == "unspecified") { return LLAMA_POOLING_TYPE_UNSPECIFIED; }
+    else if (s == "none")      { return LLAMA_POOLING_TYPE_NONE; }
+    else if (s == "mean")      { return LLAMA_POOLING_TYPE_MEAN; }
+    else if (s == "cls")       { return LLAMA_POOLING_TYPE_CLS; }
+    else if (s == "last")      { return LLAMA_POOLING_TYPE_LAST; }
+    else if (s == "rank")      { return LLAMA_POOLING_TYPE_RANK; }
+    throw std::invalid_argument("unsupported pooling_type '" + s + "', allowed values: unspecified, none, mean, cls, last, rank");
+}
+
+static enum llama_attention_type ctx_attention_type_from_str(const std::string & s) {
+    /**/ if (s == "unspecified") { return LLAMA_ATTENTION_TYPE_UNSPECIFIED; }
+    else if (s == "causal")     { return LLAMA_ATTENTION_TYPE_CAUSAL; }
+    else if (s == "non-causal") { return LLAMA_ATTENTION_TYPE_NON_CAUSAL; }
+    throw std::invalid_argument("unsupported attention_type '" + s + "', allowed values: unspecified, causal, non-causal");
+}
+
+static enum llama_flash_attn_type ctx_flash_attn_type_from_str(const std::string & s) {
+    /**/ if (s == "auto")    { return LLAMA_FLASH_ATTN_TYPE_AUTO; }
+    else if (s == "enabled")  { return LLAMA_FLASH_ATTN_TYPE_ENABLED; }
+    else if (s == "disabled") { return LLAMA_FLASH_ATTN_TYPE_DISABLED; }
+    throw std::invalid_argument("unsupported flash_attn_type '" + s + "', allowed values: auto, enabled, disabled");
+}
+
+std::vector<std::unique_ptr<field>> make_llama_ctx_schema(common_params & params) {
+    std::vector<std::unique_ptr<field>> fields;
+    auto add = [&](field * f) {
+        fields.emplace_back(f);
+    };
+
+    //
+    // Sizing / batch params
+    //
+
+    add((new field_num<int32_t>("n_ctx", params.n_ctx))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Text context size. 0 = let the fit algorithm decide (or use the model's training context)"));
+
+    add((new field_num<int32_t>("n_parallel", params.n_parallel))
+        ->set_hard_limits(1, INT32_MAX)
+        ->set_desc("Maximum number of parallel sequences (i.e. distinct states). Changing this recreates the slot pool"));
+
+    add((new field_num<int32_t>("n_batch", params.n_batch))
+        ->set_hard_limits(1, INT32_MAX)
+        ->set_desc("Logical maximum batch size that can be submitted to llama_decode"));
+
+    add((new field_num<int32_t>("n_ubatch", params.n_ubatch))
+        ->set_hard_limits(1, INT32_MAX)
+        ->set_desc("Physical maximum batch size"));
+
+    //
+    // Thread params
+    //
+
+    add((new field_num<int32_t>("n_threads", params.cpuparams.n_threads))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Number of threads to use for generation (-1 = use std::thread::hardware_concurrency())"));
+
+    add((new field_num<int32_t>("n_threads_batch", params.cpuparams_batch.n_threads))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Number of threads to use for batch processing (-1 = use std::thread::hardware_concurrency())"));
+
+    //
+    // RoPE / YaRN params
+    //
+
+    add((new field_str("rope_scaling_type"))
+        ->set_desc("RoPE frequency scaling method (unspecified, none, linear, yarn, longrope)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.rope_scaling_type = ctx_rope_scaling_type_from_str(data.at("rope_scaling_type").get<std::string>());
+        }));
+
+    add((new field_num<float>("rope_freq_base", params.rope_freq_base))
+        ->set_desc("RoPE base frequency (0 = from model)"));
+
+    add((new field_num<float>("rope_freq_scale", params.rope_freq_scale))
+        ->set_desc("RoPE frequency scaling factor (0 = from model)"));
+
+    add((new field_num<float>("yarn_ext_factor", params.yarn_ext_factor))
+        ->set_desc("YaRN extrapolation mix factor (negative = from model)"));
+
+    add((new field_num<float>("yarn_attn_factor", params.yarn_attn_factor))
+        ->set_desc("YaRN magnitude scaling factor"));
+
+    add((new field_num<float>("yarn_beta_fast", params.yarn_beta_fast))
+        ->set_desc("YaRN low correction dim (negative = from model)"));
+
+    add((new field_num<float>("yarn_beta_slow", params.yarn_beta_slow))
+        ->set_desc("YaRN high correction dim (negative = from model)"));
+
+    add((new field_num<int32_t>("yarn_orig_ctx", params.yarn_orig_ctx))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("YaRN original context size (0 = from model)"));
+
+    //
+    // Attention / pooling / flash-attn params
+    //
+
+    add((new field_str("pooling_type"))
+        ->set_desc("Pooling type for embeddings (unspecified, none, mean, cls, last, rank)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.pooling_type = ctx_pooling_type_from_str(data.at("pooling_type").get<std::string>());
+        }));
+
+    add((new field_str("attention_type"))
+        ->set_desc("Attention type for embeddings (unspecified, causal, non-causal)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.attention_type = ctx_attention_type_from_str(data.at("attention_type").get<std::string>());
+        }));
+
+    add((new field_str("flash_attn_type"))
+        ->set_desc("When to enable Flash Attention (auto, enabled, disabled)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.flash_attn_type = ctx_flash_attn_type_from_str(data.at("flash_attn_type").get<std::string>());
+        }));
+
+    //
+    // KV cache params
+    //
+
+    add((new field_str("cache_type_k"))
+        ->set_desc("KV cache data type for K (f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.cache_type_k = ctx_kv_cache_type_from_str(data.at("cache_type_k").get<std::string>());
+        }));
+
+    add((new field_str("cache_type_v"))
+        ->set_desc("KV cache data type for V (f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.cache_type_v = ctx_kv_cache_type_from_str(data.at("cache_type_v").get<std::string>());
+        }));
+
+    //
+    // Boolean flags
+    //
+
+    add((new field_bool("embeddings", params.embedding))
+        ->set_desc("If true, extract embeddings (together with logits)"));
+
+    // offload_kqv / op_offload are stored inverted in common_params (no_kv_offload / no_op_offload)
+    add((new field_bool("offload_kqv", params.no_kv_offload))
+        ->set_desc("Offload the KQV ops (including the KV cache) to GPU")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.no_kv_offload = !data.at("offload_kqv").get<bool>();
+        }));
+
+    add((new field_bool("op_offload", params.no_op_offload))
+        ->set_desc("Offload host tensor operations to device")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.no_op_offload = !data.at("op_offload").get<bool>();
+        }));
+
+    add((new field_bool("no_perf", params.no_perf))
+        ->set_desc("If true, do not measure performance timings"));
+
+    add((new field_bool("swa_full", params.swa_full))
+        ->set_desc("Use full-size SWA cache (disabled automatically if the model has no SWA)"));
+
+    add((new field_bool("kv_unified", params.kv_unified))
+        ->set_desc("Use a unified buffer across the input sequences when computing the attention"));
+
+    return fields;
+}
+
+common_params eval_llama_ctx_schema(
+                const common_params & params_base,
+                const json & data) {
+    // unset fields inherit the existing runtime params as default values
+    common_params params = params_base;
+
+    // the ctx schema never dereferences ctx.params (all fields bind directly to `params`),
+    // so a default-constructed context (params_ptr == nullptr) is fine here
+    field_eval_context ctx;
+
+    auto schema = make_llama_ctx_schema(params);
+
+    // eval all fields in the schema
+    for (const auto & f : schema) {
+        f->eval(ctx, data);
+    }
+
+    return params;
+}
+
 
 //
 // eval() implementations
