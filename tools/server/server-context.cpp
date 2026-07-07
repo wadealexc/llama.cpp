@@ -1100,37 +1100,66 @@ private:
                 }
                 cparams_dft.n_rs_seq = 0;
 
-                std::vector<ggml_backend_dev_t> devs;
-                uint32_t hp_ngl = 0;
-                uint32_t hp_nct = 0;
-                uint32_t hp_nex = 0;
-                try {
+                std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
+                if (tgt_devices.empty()) {
+                    for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                       tgt_devices.push_back(ggml_backend_dev_get(i));
+                    }
+                }
+
+                // helper: measure the spec context at a given n_ctx and return per-device totals
+                // (model + context + compute) mapped onto the target device indices.
+                auto measure = [&](uint32_t n_ctx, std::vector<size_t> & bytes_per_tgt_dev, uint32_t & hp_nct) -> void {
+                    llama_context_params cp = cparams_dft;
+                    cp.n_ctx = n_ctx;
+
+                    std::vector<ggml_backend_dev_t> devs;
+                    uint32_t hp_ngl = 0, hp_nex = 0;
+                    hp_nct = 0;
                     auto dmd = common_get_device_memory_data(
-                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                        params_dft.model.path.c_str(), &mparams_dft, &cp,
                         devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
 
-                    GGML_ASSERT(!params_base.fit_params_target.empty());
-                    size_t total = 0;
-
-                    std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
-
-                    if (tgt_devices.empty()) {
-                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                           tgt_devices.push_back(ggml_backend_dev_get(i));
-                        }
-                    }
-
+                    bytes_per_tgt_dev.assign(tgt_devices.size(), 0);
                     for (size_t j = 0; j < devs.size(); ++j) {
                         const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
-                        total += bytes;
                         for (size_t i = 0; i < tgt_devices.size(); i++) {
                             if (tgt_devices[i] == devs[j]) {
-                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
-                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
-                                params_base.fit_params_target[i] += bytes;
+                                bytes_per_tgt_dev[i] += bytes;
                                 break;
                             }
                         }
+                    }
+                    return;
+                };
+
+                GGML_ASSERT(!params_base.fit_params_target.empty());
+                try {
+                    // two-point measurement: split the spec footprint into a ctx-independent
+                    // fixed part (added to the margin) and a per-ctx part (folded into the
+                    // target fit's context-size interpolation). This avoids estimating the
+                    // spec context at n_ctx_train when the target will be fit to a smaller ctx.
+                    uint32_t hp_nct = 0;  // n_ctx_train of the spec model
+                    std::vector<size_t> bytes_full, bytes_min;
+                    measure(0, bytes_full, hp_nct);       // n_ctx == 0 -> resolves to hp_nct
+                    const uint32_t n_ctx_min = params_base.fit_params_min_ctx;
+                    measure(n_ctx_min, bytes_min, hp_nct);
+
+                    size_t total = 0;
+                    for (size_t i = 0; i < tgt_devices.size(); i++) {
+                        size_t per_ctx = 0;
+                        size_t fixed   = bytes_full[i];
+                        if (hp_nct > n_ctx_min && bytes_full[i] > bytes_min[i]) {
+                            per_ctx = (bytes_full[i] - bytes_min[i]) / (hp_nct - n_ctx_min);
+                            fixed   = bytes_full[i] - per_ctx * hp_nct;
+                        }
+                        SRV_DBG("[spec] adding %.2f MiB (fixed) + %.2f MiB/ctx to fit_params for device %s\n",
+                                fixed / (1024.0 * 1024.0),
+                                per_ctx / (1024.0 * 1024.0),
+                                ggml_backend_dev_name(tgt_devices[i]));
+                        params_base.fit_params_target[i]        += fixed;
+                        params_base.fit_params_overhead_per_ctx[i] += per_ctx;
+                        total += bytes_full[i];
                     }
                     SRV_TRC("[spec] estimated memory usage of %s is %.2f MiB\n",
                             has_draft ? "draft model" : "MTP context",

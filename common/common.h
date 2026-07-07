@@ -480,6 +480,9 @@ struct common_params {
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
+    // per-device bytes-per-ctx overhead for fitting parameters to free memory (used for draft/mtp ctx)
+    std::vector<size_t> fit_params_overhead_per_ctx = std::vector<size_t>(llama_max_devices(), 0);
+
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
 
     common_cpu_params cpuparams;

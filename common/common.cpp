@@ -1227,7 +1227,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR,
+            params.fit_params_overhead_per_ctx.data());
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1315,6 +1316,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
     }
+
+    // persist the resolved context size back into params
+    params.n_ctx = llama_n_ctx(lctx);
 
     pimpl->context.reset(lctx);
 }

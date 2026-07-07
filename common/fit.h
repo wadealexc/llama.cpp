@@ -20,11 +20,12 @@ common_params_fit_status common_fit_params(
                          const char * path_model,
                  llama_model_params * mparams,
                llama_context_params * cparams,
-                              float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
-   llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
-                             size_t * margins,               // margins of memory to leave per device in bytes
-                           uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
-                     ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
+                              float * tensor_split,                // writable buffer for tensor split, needs at least llama_max_devices elements
+   llama_model_tensor_buft_override * tensor_buft_overrides,       // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
+                             size_t * margins,                     // margins of memory to leave per device in bytes
+                           uint32_t   n_ctx_min,                   // minimum context size to set when trying to reduce memory use
+                     ggml_log_level   log_level,                   // minimum log level to print during fitting, lower levels go to debug log
+                             size_t * overhead_per_ctx = nullptr); // optional per-device bytes-per-ctx overhead (for draft/mtp ctx), may be NULL
 
 // print estimated memory to stdout
 void common_fit_print(
