@@ -1216,19 +1216,12 @@ struct common_init_result::impl {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
-    auto mparams = common_model_params_to_llama(params);
-    auto cparams = common_context_params_to_llama(params);
-
+    
     if (params.fit_params) {
-        COM_TRC("%s", "fitting params to device memory ...\n");
-        COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        common_fit_from_params_base(params);
     }
+
+    auto mparams = common_model_params_to_llama(params);
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
@@ -1240,8 +1233,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (model_only) {
         return;
     }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
@@ -1261,6 +1252,22 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         la.prompt_prefix = buf;
         pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
     }
+
+    if (!init_context_inner(params)) {
+        COM_ERR("%s", "failed to initialize context\n");
+        return;
+    }
+
+    finalize_and_warmup(params);
+}
+
+bool common_init_result::init_context_inner(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    GGML_ASSERT(model);
+
+    auto cparams = common_context_params_to_llama(params);
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     // updates params.sampling
     // TODO: fix naming
@@ -1313,10 +1320,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return;
+        return false;
     }
 
     pimpl->context.reset(lctx);
+    return true;
 }
 
 llama_model * common_init_result::model() {
@@ -1344,24 +1352,12 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
+void common_init_result::finalize_and_warmup(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    GGML_ASSERT(model);
 
-    llama_model * model = res->model();
-    if (model == NULL) {
-        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
-        return res;
-    }
-
-    if (model_only) {
-        return res;
-    }
-
-    llama_context * lctx = res->context();
-    if (lctx == NULL) {
-        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return res;
-    }
+    llama_context * lctx = pimpl->context.get();
+    GGML_ASSERT(lctx);
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1376,7 +1372,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         const auto cvec = common_control_vector_load(params.control_vectors);
         if (cvec.n_embd == -1) {
-            return res;
+            return;
         }
 
         int err = llama_set_adapter_cvec(
@@ -1387,7 +1383,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 params.control_vector_layer_start,
                 params.control_vector_layer_end);
         if (err) {
-            return res;
+            return;
         }
     }
 
@@ -1411,7 +1407,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
 
         if (!ok) {
-            return res;
+            return;
         }
     }
 
@@ -1454,7 +1450,54 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_perf_context_reset(lctx);
 
         // reset samplers to reset RNG state after warmup to the seeded state
-        res->reset_samplers();
+        reset_samplers();
+    }
+}
+
+void common_init_result::reset_context() {
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
+    pimpl->context.reset();
+}
+
+llama_context * common_init_result::reinit_context(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    GGML_ASSERT(model);
+
+    // reset samplers, and context
+    reset_context();
+
+    if (params.fit_params) {
+        common_fit_from_params_base(params);
+    }
+
+    if (!init_context_inner(params)) {
+        COM_ERR("%s", "failed to reinitialize context\n");
+        return nullptr;
+    }
+
+    finalize_and_warmup(params);
+
+    return pimpl->context.get();
+}
+
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    llama_context * lctx = res->context();
+    if (lctx == NULL) {
+        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        return res;
     }
 
     return res;
@@ -1623,6 +1666,39 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
 
     return cparams;
+}
+
+bool common_fit_from_params_base(common_params & params) {
+    LOG_INF("%s: fitting params to device memory ...\n", __func__);
+    LOG_INF("%s: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n", __func__);
+
+    llama_model_params mparams = common_model_params_to_llama(params);
+    llama_context_params cparams = common_context_params_to_llama(params);
+
+    auto status = common_fit_params(
+        params.model.path.c_str(), &mparams, &cparams,
+        params.tensor_split,
+        params.tensor_buft_overrides.data(),
+        params.fit_params_target.data(),
+        params.fit_params_min_ctx,
+        params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    
+    // common_fit_params modifies (via mparams/cparams):
+    // - n_gpu_layers
+    // - tensor_split
+    // - tensor_buft_overrides
+    // - n_ctx
+    // - fit_params_target
+    //
+    // of these, only n_ctx and n_gpu_layers need to be explicitly persisted. the rest
+    // are already owned by params.
+    if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+        params.n_ctx        = cparams.n_ctx;
+        params.n_gpu_layers = mparams.n_gpu_layers;
+        return true;
+    }
+    
+    return false;
 }
 
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {

@@ -16,10 +16,13 @@
 namespace server_schema {
 
 struct field_eval_context {
-    task_params & params;
+    task_params * params_ptr = nullptr;
     const llama_vocab * vocab = nullptr;
     const std::vector<llama_logit_bias> * logit_bias_eog = nullptr;
-    field_eval_context(task_params & params) : params(params) {}
+    field_eval_context(task_params & params) : params_ptr(&params) {}
+    field_eval_context() = default;
+    // dereference helper: cmpl handlers use ctx.params().X
+    task_params & params() { return *params_ptr; }
 };
 
 using field_handler = std::function<void(field_eval_context &, const json &)>;
@@ -100,6 +103,17 @@ task_params eval_llama_cmpl_schema(
                     const common_params & params_base,
                     const int n_ctx_slot,
                     const std::vector<llama_logit_bias> & logit_bias_eog,
+                    const json & data);
+
+// Context-parameter schema.
+//
+// Unset fields inherit the runtime `params_base` as defaults. Returns a
+// `common_params` copy of `params_base` with the context-relevant fields
+// overwritten from `data`; this is consumed by `reload_context`.
+std::vector<std::unique_ptr<field>> make_llama_ctx_schema(common_params & params);
+
+common_params eval_llama_ctx_schema(
+                    const common_params & params_base,
                     const json & data);
 
 } // namespace server_schema
