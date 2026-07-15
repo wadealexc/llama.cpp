@@ -1357,10 +1357,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
     }
 
-    // updates params.sampling
-    // TODO: fix naming
-    common_init_sampler_from_model(model, params.sampling);
-
     if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
         COM_WRN("%s", "vocab does not have an EOS token, ignoring --ignore-eos\n");
         params.sampling.ignore_eos = false;
@@ -1381,6 +1377,28 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
+    init_context_inner(params);
+}
+
+llama_context * common_init_result::init_context_inner(common_params & params) {
+    llama_model * model = pimpl->model.get();
+
+    auto cparams = common_context_params_to_llama(params);
+
+    // updates params.sampling
+    // TODO: fix naming
+    common_init_sampler_from_model(model, params.sampling);
+
+    //if (params.sampling.penalty_last_n == -1) {
+    //    LOG_TRC("%s: setting penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
+    //    params.sampling.penalty_last_n = llama_n_ctx(lctx);
+    //}
+
+    //if (params.sampling.dry_penalty_last_n == -1) {
+    //    LOG_TRC("%s: setting dry_penalty_last_n to ctx_size = %d\n", __func__, llama_n_ctx(lctx));
+    //    params.sampling.dry_penalty_last_n = llama_n_ctx(lctx);
+    //}
+
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
@@ -1398,7 +1416,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return;
+        return NULL;
     }
 
     pimpl->context.reset(lctx);
@@ -1406,6 +1424,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     set_process_priority(params.cpuparams.priority);
 
     pimpl->threadpools.init(lctx, params);
+
+    // persist resolved context size back to params
+    params.n_ctx = llama_n_ctx(lctx);
+
+    return lctx;
 }
 
 llama_model * common_init_result::model() {
@@ -1433,24 +1456,9 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
-    common_init_result_ptr res(new common_init_result(params, model_only));
-
-    llama_model * model = res->model();
-    if (model == NULL) {
-        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
-        return res;
-    }
-
-    if (model_only) {
-        return res;
-    }
-
-    llama_context * lctx = res->context();
-    if (lctx == NULL) {
-        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
-        return res;
-    }
+void common_init_result::finalize_and_warmup(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    llama_context * lctx = pimpl->context.get();
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
@@ -1465,7 +1473,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
         const auto cvec = common_control_vector_load(params.control_vectors);
         if (cvec.n_embd == -1) {
-            return res;
+            return;
         }
 
         int err = llama_set_adapter_cvec(
@@ -1476,7 +1484,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
                 params.control_vector_layer_start,
                 params.control_vector_layer_end);
         if (err) {
-            return res;
+            return;
         }
     }
 
@@ -1500,7 +1508,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         }
 
         if (!ok) {
-            return res;
+            return;
         }
     }
 
@@ -1543,8 +1551,50 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_perf_context_reset(lctx);
 
         // reset samplers to reset RNG state after warmup to the seeded state
-        res->reset_samplers();
+        reset_samplers();
     }
+}
+
+llama_context * common_init_result::reinit_context(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    GGML_ASSERT(model);
+
+    // reset samplers and context
+    pimpl->samplers.clear();
+    pimpl->samplers_seq_config.clear();
+    pimpl->context.reset();
+
+    llama_context * lctx = init_context_inner(params);
+    if (lctx == NULL) {
+        COM_ERR("%s", "failed to reinitialize context\n");
+        return NULL;
+    }
+
+    finalize_and_warmup(params);
+
+    return lctx;
+}
+
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_init_result_ptr res(new common_init_result(params, model_only));
+
+    llama_model * model = res->model();
+    if (model == NULL) {
+        COM_ERR("failed to load model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    if (model_only) {
+        return res;
+    }
+
+    llama_context * lctx = res->context();
+    if (lctx == NULL) {
+        COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
+        return res;
+    }
+
+    res->finalize_and_warmup(params);
 
     return res;
 }
