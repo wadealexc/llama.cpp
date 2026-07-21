@@ -101,4 +101,19 @@ task_params eval_llama_cmpl_schema(
                     const std::vector<llama_logit_bias> & logit_bias_eog,
                     const json & data);
 
+std::vector<std::unique_ptr<field>> make_llama_ctx_schema(common_params & params);
+
+std::vector<std::unique_ptr<field>> make_llama_mmproj_schema(common_params & params);
+
+std::vector<std::unique_ptr<field>> make_llama_spec_schema(common_params_speculative & spec);
+
+// Combined schema for context, mmproj, and spec
+std::vector<std::unique_ptr<field>> make_llama_reload_schema(common_params & params);
+
+// Returns a copy of `params_base` with any reload-relevant fields from `data` overlaid on top
+// Unset fields inherit `params_base` as defaults.
+common_params eval_llama_reload_schema(
+                    const common_params & params_base,
+                    const json & data);
+
 } // namespace server_schema

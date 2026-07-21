@@ -1,5 +1,6 @@
 #include "server-schema.h"
 
+#include "common.h"
 #include "json-schema-to-grammar.h"
 
 namespace server_schema {
@@ -561,6 +562,232 @@ task_params eval_llama_cmpl_schema(
                 params.sampling.reasoning_budget_start.size(),
                 params.sampling.reasoning_budget_end.size(),
                 params.sampling.reasoning_budget_forced.size());
+    }
+
+    return params;
+}
+
+//
+// context schema
+//
+
+// TODO: extracted from common/arg.cpp; shared impl would be better
+static const std::vector<ggml_type> ctx_kv_cache_types = {
+    GGML_TYPE_F32,
+    GGML_TYPE_F16,
+    GGML_TYPE_BF16,
+    GGML_TYPE_Q8_0,
+    GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1,
+    GGML_TYPE_IQ4_NL,
+    GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1,
+};
+
+static ggml_type ctx_kv_cache_type_from_str(const std::string & s) {
+    for (const auto & type : ctx_kv_cache_types) {
+        if (ggml_type_name(type) == s) {
+            return type;
+        }
+    }
+    std::string allowed;
+    for (const auto & type : ctx_kv_cache_types) {
+        allowed += ggml_type_name(type);
+        allowed += (&type == &ctx_kv_cache_types.back() ? "" : ", ");
+    }
+    throw std::invalid_argument("unsupported cache type '" + s + "', allowed values: " + allowed);
+}
+
+std::vector<std::unique_ptr<field>> make_llama_ctx_schema(common_params & params) {
+    std::vector<std::unique_ptr<field>> fields;
+    auto add = [&](field * f) {
+        fields.emplace_back(f);
+    };
+
+    //
+    // Sizing / batch params
+    //
+
+    add((new field_num<int32_t>("n_ctx", params.n_ctx))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Text context size. 0 = let the fit algorithm decide (or use the model's training context)"));
+
+    add((new field_num<int32_t>("n_batch", params.n_batch))
+        ->set_hard_limits(1, INT32_MAX)
+        ->set_desc("Logical maximum batch size that can be submitted to llama_decode"));
+
+    add((new field_num<int32_t>("n_ubatch", params.n_ubatch))
+        ->set_hard_limits(1, INT32_MAX)
+        ->set_desc("Physical maximum batch size"));
+
+    //
+    // KV cache params
+    //
+
+    add((new field_str("cache_type_k"))
+        ->set_desc("KV cache data type for K (f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.cache_type_k = ctx_kv_cache_type_from_str(data.at("cache_type_k").get<std::string>());
+        }));
+
+    add((new field_str("cache_type_v"))
+        ->set_desc("KV cache data type for V (f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.cache_type_v = ctx_kv_cache_type_from_str(data.at("cache_type_v").get<std::string>());
+        }));
+
+    //
+    // Boolean flags
+    //
+
+    add((new field_bool("offload_kqv", params.no_kv_offload))
+        ->set_desc("Offload the KQV ops (including the KV cache) to GPU")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.no_kv_offload = !data.at("offload_kqv").get<bool>();
+        }));
+
+    add((new field_bool("op_offload", params.no_op_offload))
+        ->set_desc("Offload host tensor operations to device")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.no_op_offload = !data.at("op_offload").get<bool>();
+        }));
+
+    add((new field_bool("swa_full", params.swa_full))
+        ->set_desc("Use full-size SWA cache (disabled automatically if the model has no SWA)"));
+
+    add((new field_bool("kv_unified", params.kv_unified))
+        ->set_desc("Use a unified buffer across the input sequences when computing the attention"));
+
+    return fields;
+}
+
+//
+// mmproj schema
+//
+
+std::vector<std::unique_ptr<field>> make_llama_mmproj_schema(common_params & params) {
+    std::vector<std::unique_ptr<field>> fields;
+    auto add = [&](field * f) {
+        fields.emplace_back(f);
+    };
+
+    add((new field_str("path"))
+        ->set_desc("Path to a multimodal projector file. Empty string unloads the current projector")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            params.mmproj.path = data.at("path").get<std::string>();
+        }));
+
+    add((new field_bool("mmproj_offload", params.mmproj_use_gpu))
+        ->set_desc("Whether to enable GPU offloading for the multimodal projector"));
+
+    add((new field_num<int>("image_min_tokens", params.image_min_tokens))
+        ->set_desc("Minimum number of tokens each image can take (vision models with dynamic resolution; -1 = read from model)"));
+
+    add((new field_num<int>("image_max_tokens", params.image_max_tokens))
+        ->set_desc("Maximum number of tokens each image can take (vision models with dynamic resolution; -1 = read from model)"));
+
+    add((new field_num<int>("mtmd_batch_max_tokens", params.mtmd_batch_max_tokens))
+        ->set_desc("Maximum number of image tokens per batch when encoding images"));
+
+    return fields;
+}
+
+//
+// spec/mtp schema
+//
+
+std::vector<std::unique_ptr<field>> make_llama_spec_schema(common_params_speculative & spec) {
+    std::vector<std::unique_ptr<field>> fields;
+    auto add = [&](field * f) {
+        fields.emplace_back(f);
+    };
+
+    add((new field_str("type"))
+        ->set_desc("Speculative decoding method (none, draft-simple, draft-eagle3, draft-mtp, draft-dflash, ngram-*)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            auto t = common_speculative_type_from_name(data.at("type").get<std::string>());
+            if (t == COMMON_SPECULATIVE_TYPE_NONE) {
+                spec = {};
+            } else {
+                spec.types = { t };
+            }
+        }));
+
+    add((new field_json("types"))
+        ->set_desc("Array of speculative decoding methods (see 'type')")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_UNUSED(ctx);
+            std::vector<std::string> names;
+            for (const auto & t : data.at("types")) {
+                names.push_back(t.get<std::string>());
+            }
+            auto types = common_speculative_types_from_names(names);
+            for (auto t : types) {
+                if (t == COMMON_SPECULATIVE_TYPE_NONE) {
+                    spec = {};
+                    return;
+                }
+            }
+            spec.types = std::move(types);
+        }));
+
+    add((new field_nested("draft"))
+        ->add_subfield((new field_str("path"))
+            ->set_desc("Path to the draft model file")
+            ->set_handler([&](field_eval_context & ctx, const json & data) {
+                GGML_UNUSED(ctx);
+                spec.draft.mparams.path = data.at("path").get<std::string>();
+            }))
+        ->add_subfield((new field_num<int32_t>("n_max", spec.draft.n_max))
+            ->set_desc("Maximum number of tokens to draft"))
+        ->add_subfield((new field_num<int32_t>("n_min", spec.draft.n_min))
+            ->set_desc("Minimum number of draft tokens to use"))
+        ->add_subfield((new field_num<float>("p_split", spec.draft.p_split))
+            ->set_desc("Speculative decoding split probability"))
+        ->add_subfield((new field_num<float>("p_min", spec.draft.p_min))
+            ->set_desc("Minimum speculative decoding probability (greedy)"))
+        ->add_subfield((new field_num<int32_t>("n_gpu_layers", spec.draft.n_gpu_layers))
+            ->set_desc("Number of draft model layers to store in VRAM (-1 = auto, -2 = all)"))
+        ->set_desc("Draft-model configuration for speculative decoding"));
+
+    return fields;
+}
+
+//
+// model reload schema (context + mmproj + speculative)
+//
+
+std::vector<std::unique_ptr<field>> make_llama_reload_schema(common_params & params) {
+    std::vector<std::unique_ptr<field>> fields;
+    auto append = [&](std::vector<std::unique_ptr<field>> & src) {
+        for (auto & f : src) {
+            fields.push_back(std::move(f));
+        }
+    };
+    auto ctx_fields    = make_llama_ctx_schema(params);            append(ctx_fields);
+    auto mmproj_fields = make_llama_mmproj_schema(params);         append(mmproj_fields);
+    auto spec_fields   = make_llama_spec_schema(params.speculative); append(spec_fields);
+    return fields;
+}
+
+common_params eval_llama_reload_schema(
+                const common_params & params_base,
+                const json & data) {
+    common_params params = params_base;
+
+    task_params dummy;
+    field_eval_context ctx(dummy);
+
+    auto schema = make_llama_reload_schema(params);
+
+    for (const auto & f : schema) {
+        f->eval(ctx, data);
     }
 
     return params;
