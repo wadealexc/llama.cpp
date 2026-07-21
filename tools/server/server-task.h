@@ -32,6 +32,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_TTS,
+    SERVER_TASK_TYPE_RELOAD,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -243,6 +244,9 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_TTS
     mtmd_helper::gen_audio::inp tts_inp;
+
+    // used by SERVER_TASK_TYPE_RELOAD
+    json reload_body;
 
     server_task() = default;
 
@@ -681,6 +685,20 @@ struct server_task_result_get_lora : server_task_result {
 
 struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
+};
+
+struct server_task_result_reload : server_task_result {
+    bool        success = false;
+    int32_t     n_ctx   = 0;
+    std::string message; // optional detail when success is false
+
+    virtual json to_json() override {
+        json out = json { { "success", success }, { "n_ctx", n_ctx } };
+        if (!message.empty()) {
+            out["message"] = message;
+        }
+        return out;
+    }
 };
 
 struct server_prompt {

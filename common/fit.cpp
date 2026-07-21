@@ -984,6 +984,164 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
+static std::vector<size_t> common_fit_reload_needed(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const common_fit_extra_model * extra,
+        uint32_t n_ctx,
+        ggml_log_level log_level) {
+    llama_context_params cparams_ctx = *cparams;
+    cparams_ctx.n_ctx = n_ctx;
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+
+    auto dmds = common_get_device_memory_data(
+        path_model, mparams, &cparams_ctx,
+        devs, hp_ngl, hp_nct, hp_nex,
+        log_level);
+
+    const size_t nd = dmds.size() - 1;
+
+    std::vector<size_t> needed(dmds.size(), 0);
+    for (size_t i = 0; i < dmds.size(); i++) {
+        needed[i] += dmds[i].context + dmds[i].compute;
+    }
+
+    if (extra) {
+        llama_context_params cparams_extra = *extra->cparams;
+        cparams_extra.n_ctx = n_ctx;
+
+        std::vector<ggml_backend_dev_t> devs_extra;
+        uint32_t extra_ngl = 0;
+        uint32_t extra_nct = 0;
+        uint32_t extra_nex = 0;
+
+        auto dmds_extra = common_get_device_memory_data(
+            extra->path_model, extra->mparams, &cparams_extra,
+            devs_extra, extra_ngl, extra_nct, extra_nex,
+            log_level);
+
+        for (size_t j = 0; j + 1 < dmds_extra.size(); j++) {
+            size_t matched = nd;
+            for (size_t i = 0; i < nd; i++) {
+                if (devs_extra[j] == devs[i]) {
+                    matched = i;
+                    break;
+                }
+            }
+            needed[matched] += extra->shares_model
+                ? dmds_extra[j].context + dmds_extra[j].compute
+                : dmds_extra[j].model + dmds_extra[j].context + dmds_extra[j].compute;
+        }
+        needed[nd] += extra->shares_model
+            ? dmds_extra.back().context + dmds_extra.back().compute
+            : dmds_extra.back().model + dmds_extra.back().context + dmds_extra.back().compute;
+    }
+
+    return needed;
+}
+
+uint32_t common_fit_ctx_from_avail(
+        const size_t * needed_max,
+        const size_t * needed_min,
+        const size_t * avail,
+        size_t nd,
+        uint32_t n_ctx_max,
+        uint32_t n_ctx_min,
+        uint32_t n_streams) {
+    uint32_t n_ctx_fit = n_ctx_max;
+
+    if (nd == 0) {
+        if (avail[0] >= needed_max[0]) {
+            n_ctx_fit = n_ctx_max;
+        } else if (avail[0] <= needed_min[0]) {
+            n_ctx_fit = n_ctx_min;
+        } else {
+            uint64_t num = (uint64_t)(avail[0] - needed_min[0]) * (n_ctx_max - n_ctx_min);
+            uint64_t den = needed_max[0] - needed_min[0];
+            n_ctx_fit = n_ctx_min + (uint32_t)(num / den);
+        }
+    } else {
+        for (size_t i = 0; i < nd; i++) {
+            uint32_t n_ctx_dev;
+            if (avail[i] >= needed_max[i]) {
+                n_ctx_dev = n_ctx_max;
+            } else if (avail[i] <= needed_min[i]) {
+                n_ctx_dev = n_ctx_min;
+            } else {
+                uint64_t num = (uint64_t)(avail[i] - needed_min[i]) * (n_ctx_max - n_ctx_min);
+                uint64_t den = needed_max[i] - needed_min[i];
+                n_ctx_dev = n_ctx_min + (uint32_t)(num / den);
+            }
+
+            n_ctx_dev = n_ctx_dev - (n_ctx_dev % (256 * n_streams));
+            if (n_ctx_dev < n_ctx_fit) {
+                n_ctx_fit = n_ctx_dev;
+            }
+        }
+    }
+
+    n_ctx_fit = n_ctx_fit - (n_ctx_fit % (256 * n_streams));
+
+    return n_ctx_fit;
+}
+
+common_params_fit_status common_fit_for_reload(
+        const char * path_model,
+        const llama_model * model,
+        const llama_model_params * mparams,
+        llama_context_params * cparams,
+        size_t * margins,
+        uint32_t n_ctx_min,
+        const common_fit_extra_model * extra,
+        ggml_log_level log_level) {
+    const int64_t t0_us = llama_time_us();
+    common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+
+    const uint32_t n_ctx_train     = llama_model_n_ctx_train(model);
+    const uint32_t n_streams       = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
+    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>((uint64_t) n_ctx_train * n_streams, UINT32_MAX);
+    const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>((uint64_t) n_ctx_min * n_streams, UINT32_MAX);
+
+    const size_t nd = llama_model_n_devices(model);
+    std::vector<size_t> avail(nd + 1, SIZE_MAX);
+    for (size_t i = 0; i < nd; i++) {
+        size_t dev_free;
+        size_t dev_total;
+        ggml_backend_dev_memory(llama_model_get_device(model, i), &dev_free, &dev_total);
+
+        avail[i] = margins[i] < dev_free ? dev_free - margins[i] : 0;
+    }
+
+    try {
+        auto needed_max = common_fit_reload_needed(path_model, mparams, cparams, extra, n_ctx_max, log_level);
+        auto needed_min = common_fit_reload_needed(path_model, mparams, cparams, extra, n_ctx_min_total, log_level);
+
+        GGML_ASSERT(needed_max.size() == avail.size());
+
+        const uint32_t n_ctx = common_fit_ctx_from_avail(
+                needed_max.data(), needed_min.data(), avail.data(),
+                needed_max.size() - 1, n_ctx_max, n_ctx_min_total, n_streams);
+
+        if (n_ctx < n_ctx_min_total) {
+            LOG_WRN("%s: calculated n_ctx = %" PRIu32 " is less than minimum %" PRIu32 "\n", __func__, n_ctx, n_ctx_min_total);
+            status = COMMON_PARAMS_FIT_STATUS_FAILURE;
+        } else {
+            cparams->n_ctx = n_ctx;
+        }
+    } catch (const std::runtime_error & e) {
+        LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
+        status = COMMON_PARAMS_FIT_STATUS_ERROR;
+    }
+    const int64_t t1_us = llama_time_us();
+    LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
+    return status;
+}
+
 std::vector<common_memory_breakdown_row> common_memory_breakdown_rows(const struct llama_context * ctx) {
     const auto * model = llama_get_model(ctx);
 

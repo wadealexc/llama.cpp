@@ -70,6 +70,10 @@ struct server_context {
     // returns true on success
     bool load_model(common_params & params);
 
+    // reinitialize the model's context, mmproj, and spec decoder
+    // returns true on success
+    bool reload_model(common_params & params);
+
     // this function will block main thread until termination
     void start_loop();
 
@@ -136,6 +140,7 @@ struct server_routes {
     server_http_context::handler_t post_systemone;
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
+    server_http_context::handler_t post_reload;
 
     // to be used in router mode
     json get_model_info() const;

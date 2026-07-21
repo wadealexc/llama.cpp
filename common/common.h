@@ -1007,9 +1007,15 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    void reset_context();
+    llama_context * reinit_context(common_params & params);
+
+    void finalize_and_warmup(common_params & params);
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    llama_context * init_context_inner(common_params & params, llama_context_params & cparams);
 };
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
@@ -1045,6 +1051,7 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+    void reset();
 
 private:
     ggml_threadpool * threadpool       = nullptr;
