@@ -916,9 +916,14 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    llama_context * reinit_context(common_params & params);
+
+    void finalize_and_warmup(common_params & params);
 private:
     struct impl;
     std::unique_ptr<impl> pimpl;
+
+    llama_context * init_context_inner(common_params & params);
 };
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
@@ -928,6 +933,9 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+// overlay context-specific fields from ctx onto params
+void common_overlay_context_params(common_params & params, llama_context_params ctx);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
