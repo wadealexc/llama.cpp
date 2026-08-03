@@ -1427,11 +1427,8 @@ private:
         load_progress_data load_progress_text  (this, "text_model");
         load_progress_data load_progress_spec  (this, "spec_model");
 
-        // get only llama_context_params from input; other params are ignored
-        auto new_ctx_params = common_context_params_to_llama(params);
-
-        // merge existing common_params with new context params
-        common_overlay_context_params(params_base, new_ctx_params);
+        // Persist new params
+        params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
 
         const bool has_draft = params_base.speculative.has_dft();
@@ -1524,34 +1521,22 @@ private:
     bool reload_mmproj(common_params & params) {
         load_progress_data load_progress_mmproj(this, "mmproj_model");
 
-        std::string & mmproj_path = params.mmproj.path;
+        // Persist new params
+        params_base = params;
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        std::string & mmproj_path = params_base.mmproj.path;
         bool has_mmproj_old = mctx != nullptr;
         bool has_mmproj_new = !mmproj_path.empty();
 
-        // if we have an mmproj, merge config with params_base
-        mtmd_context_params mparams = build_mtmd_context_params(params);
-        if (has_mmproj_new) {
-            // TODO: I'm not sure applying all of these in reverse is quite correct
-            // flash_attn_type, for example, impacts main/speculative model context
-            // ... and I'm not sure how to handle the case where we don't have a new
-            //     mmproj. Leaving params_base as-is feels more correct.
-            params_base.mmproj.path           = mmproj_path;
-            params_base.mmproj_use_gpu        = mparams.use_gpu;
-            params_base.cpuparams.n_threads   = mparams.n_threads;
-            params_base.flash_attn_type       = mparams.flash_attn_type;
-            params_base.warmup                = mparams.warmup;
-            params_base.image_min_tokens      = mparams.image_min_tokens;
-            params_base.image_max_tokens      = mparams.image_max_tokens;
-            params_base.mtmd_batch_max_tokens = mparams.batch_max_tokens;
-        }
-
-        // progress callback
-        mparams.progress_callback           = load_progress_callback;
-        mparams.progress_callback_user_data = &load_progress_mmproj;
+        mtmd_context_params mparams = build_mtmd_context_params(params_base);
 
         if (callback_state && has_mmproj_new) {
             std::vector<std::string> stages = {"mmproj_model"};
             load_progress_mmproj.stages = stages;
+
+            mparams.progress_callback           = load_progress_callback;
+            mparams.progress_callback_user_data = &load_progress_mmproj;
 
             // trigger 0% progress
             load_progress_callback(0.0f, &load_progress_mmproj);
@@ -1595,31 +1580,28 @@ private:
     bool reload_speculative(common_params & params) {
         load_progress_data load_progress_spec  (this, "spec_model");
 
-        const bool has_draft_new = params.speculative.has_dft();
-        const bool spec_mtp_new = std::find(params.speculative.types.begin(),
-                                        params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        // Persist new params
+        params_base = params;
+        params_base.n_outputs_max = server_n_outputs_max(params_base);
+
+        params_base.speculative.draft.ctx_tgt = nullptr;
+        params_base.speculative.draft.ctx_dft = nullptr;
+
+        const bool has_draft_new = params_base.speculative.has_dft();
+        const bool spec_mtp_new = std::find(params_base.speculative.types.begin(),
+                                        params_base.speculative.types.end(),
+                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec_new = has_draft_new || spec_mtp_new;
         const bool has_spec_old = spec_init != nullptr;
 
-        // if we have a speculative model, persist new config. otherwise, clear old
-        common_params params_dft;
-        if (has_spec_new) {
-            params_base.speculative               = params.speculative;
-            params_base.speculative.draft.ctx_tgt = nullptr;
-            params_base.speculative.draft.ctx_dft = nullptr;
+        common_params params_dft = common_base_params_to_speculative(params_base);
 
-            params_dft = common_base_params_to_speculative(params_base);
-            // progress callback
+        if (callback_state && has_spec_new) {
+            std::vector<std::string> stages = {"spec_model"};
+            load_progress_spec.stages = stages;
+
             params_dft.load_progress_callback           = load_progress_callback;
             params_dft.load_progress_callback_user_data = &load_progress_spec;
-        } else {
-            params_base.speculative = {};
-        }
-
-        if (callback_state) {
-            std::vector<std::string> stages = {"spec_model"};
-            load_progress_spec.stages   = stages;
         }
 
         // NOTE: like reload_context, we do not validate that the new memory requirements
@@ -2946,6 +2928,103 @@ private:
                     params_base.lora_adapters = new_loras;
                     auto res = std::make_unique<server_task_result_apply_lora>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_RELOAD_CONTEXT:
+                {
+                    bool deferred = false;
+                    // If any slot is busy, defer this task for processing later.
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SRV_DBG("slot %d is busy, defer task, id_task = %d\n", slot.id, task.id);
+                            queue_tasks.defer(std::move(task));
+                            deferred = true;
+                            break;
+                        }
+                    }
+                    if (deferred) break;
+
+                    auto res = std::make_unique<server_task_result_reload>();
+                    res->id = task.id;
+
+                    // parse context params from json; unset fields inherit current params_base
+                    auto new_params = server_schema::eval_llama_ctx_schema(
+                        params_base,
+                        task.reload_body);
+
+                    if (!reload_context(new_params)) {
+                        res->success = false;
+                        res->message = "Unable to reinitialize context";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    res->success = true;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_RELOAD_MMPROJ:
+                {
+                    bool deferred = false;
+                    // If any slot is busy, defer this task for processing later.
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SRV_DBG("slot %d is busy, defer task, id_task = %d\n", slot.id, task.id);
+                            queue_tasks.defer(std::move(task));
+                            deferred = true;
+                            break;
+                        }
+                    }
+                    if (deferred) break;
+
+                    auto res = std::make_unique<server_task_result_reload>();
+                    res->id = task.id;
+
+                    // parse mmproj params from json; unset fields inherit current params_base
+                    auto new_params = server_schema::eval_llama_mmproj_schema(
+                        params_base,
+                        task.reload_body);
+
+                    if (!reload_mmproj(new_params)) {
+                        res->success = false;
+                        res->message = "Unable to reinitialize multimodal model";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    res->success = true;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_RELOAD_SPECULATIVE:
+                {
+                    bool deferred = false;
+                    // If any slot is busy, defer this task for processing later.
+                    for (auto & slot : slots) {
+                        if (slot.is_processing()) {
+                            SRV_DBG("slot %d is busy, defer task, id_task = %d\n", slot.id, task.id);
+                            queue_tasks.defer(std::move(task));
+                            deferred = true;
+                            break;
+                        }
+                    }
+                    if (deferred) break;
+
+                    auto res = std::make_unique<server_task_result_reload>();
+                    res->id = task.id;
+
+                    // parse speculative params from json; unset fields inherit current params_base.speculative
+                    auto new_params = params_base;
+                    new_params.speculative = server_schema::eval_llama_spec_schema(
+                        params_base,
+                        task.reload_body);
+
+                    if (!reload_speculative(new_params)) {
+                        res->success = false;
+                        res->message = "Unable to reinitialize speculative decoder";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    res->success = true;
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -5365,6 +5444,42 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_apply_lora*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->post_reload = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        std::string target = req.get_param("target");
+        server_task_type type;
+        /**/ if (target == "context")     { type = SERVER_TASK_TYPE_RELOAD_CONTEXT; }
+        else if (target == "mmproj")      { type = SERVER_TASK_TYPE_RELOAD_MMPROJ; }
+        else if (target == "speculative") { type = SERVER_TASK_TYPE_RELOAD_SPECULATIVE; }
+        else {
+            res->error(format_error_response("Invalid target", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(type);
+            task.id          = rd.get_new_id();
+            task.reload_body = json::parse(req.body);
+            rd.post_task(std::move(task), true); // high-priority task
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_reload*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
     };

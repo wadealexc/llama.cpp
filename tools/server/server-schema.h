@@ -102,4 +102,32 @@ task_params eval_llama_cmpl_schema(
                     const std::vector<llama_logit_bias> & logit_bias_eog,
                     const json & data);
 
+std::vector<std::unique_ptr<field>> make_llama_ctx_schema(common_params & params);
+
+// Returns a copy of `params_base` with any context-relevant fields from `data` overlaid on top
+common_params eval_llama_ctx_schema(
+                    const common_params & params_base,
+                    const json & data);
+
+json serialize_ctx_params(const common_params & p);
+
+std::vector<std::unique_ptr<field>> make_llama_mmproj_schema(common_params & params);
+
+// Returns a copy of `params_base` with any mmproj-relevant fields from `data` overlaid on top
+common_params eval_llama_mmproj_schema(
+                    const common_params & params_base,
+                    const json & data);
+
+json serialize_mmproj_params(const common_params & p);
+
+std::vector<std::unique_ptr<field>> make_llama_spec_schema(common_params_speculative & spec);
+
+// Returns a copy of `params_base.speculative` with any spec-relevant fields from `data` overlaid
+// If 'none' is provided as a speculative type, the resulting speculative params are empty
+common_params_speculative eval_llama_spec_schema(
+                    const common_params & params_base,
+                    const json & data);
+
+json serialize_spec_params(const common_params & p);
+
 } // namespace server_schema
