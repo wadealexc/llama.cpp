@@ -71,7 +71,8 @@ static std::string server_model_source_to_string(server_model_source source) {
 
 struct server_model_meta {
     server_model_source source = SERVER_MODEL_SOURCE_CACHE;
-    common_preset preset;
+    common_preset preset;       // currently-running effective config (base's, or active variant's)
+    common_preset base_preset;  // base's own disk preset; target for variant->base switch-back
     std::string name;
     std::set<std::string> aliases; // additional names that resolve to this model
     std::set<std::string> tags;    // informational tags, not used for routing
@@ -84,7 +85,17 @@ struct server_model_meta {
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
     mtmd_caps multimodal; // multimodal capabilities
+    std::string running_as; // name of the running variant; empty when the base config itself is running
+    std::vector<common_preset> variants; // disk-sourced variant configs available for this base
     // bool need_download = false; // whether the model needs to be downloaded before loading // TODO @ngxson: implement this
+
+    // find a variant preset by name; returns nullptr if not found
+    const common_preset * find_variant(const std::string & name) const {
+        for (const auto & v : variants) {
+            if (v.name == name) return &v;
+        }
+        return nullptr;
+    }
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -118,6 +129,10 @@ private:
     std::mutex mutex;
     std::condition_variable cv;
     std::map<std::string, instance_t> mapping;
+
+    // resolve a name (base name, alias, or variant name) to its base mapping entry.
+    // not thread-safe; caller must hold mutex
+    auto find_base_locked(const std::string & name) -> std::map<std::string, instance_t>::iterator;
 
     // for stopping models
     std::condition_variable cv_stop;

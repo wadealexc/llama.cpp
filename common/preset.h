@@ -18,6 +18,7 @@ struct common_preset_context;
 
 struct common_preset {
     std::string name;
+    std::string base;   // parent section name; empty for a base preset
 
     // options are stored as common_arg to string mapping, representing CLI arg and its value
     std::map<common_arg, std::string> options;
@@ -41,6 +42,9 @@ struct common_preset {
 
     // merge another preset into this one, overwriting existing options
     void merge(const common_preset & other);
+
+    // true if this preset has no parent
+    bool is_base_model() const { return base.empty(); }
 
     // apply preset options to common_params
     // optionally specify handled_keys to only apply a subset of options (identified by their env), if empty, apply all options
@@ -81,4 +85,5 @@ struct common_preset_context {
 
     // apply presets over a base preset (same idea as CSS cascading)
     common_presets cascade(const common_preset & base, const common_presets & presets) const;
+
 };

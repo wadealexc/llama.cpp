@@ -107,6 +107,16 @@ common_arg & common_arg::set_spec() {
     return *this;
 }
 
+common_arg & common_arg::set_context() {
+    is_context = true;
+    return *this;
+}
+
+common_arg & common_arg::set_mmproj() {
+    is_mmproj = true;
+    return *this;
+}
+
 common_arg & common_arg::set_preset_only() {
     is_preset_only = true;
     return *this;
@@ -1540,7 +1550,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.fit_params_min_ctx = UINT32_MAX;
             }
         }
-    ).set_env("LLAMA_ARG_CTX_SIZE"));
+    ).set_env("LLAMA_ARG_CTX_SIZE").set_context());
     add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
@@ -1558,14 +1568,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.n_batch = value;
         }
-    ).set_env("LLAMA_ARG_BATCH"));
+    ).set_env("LLAMA_ARG_BATCH").set_context());
     add_opt(common_arg(
         {"-ub", "--ubatch-size"}, "N",
         string_format("physical maximum batch size (default: %d)", params.n_ubatch),
         [](common_params & params, int value) {
             params.n_ubatch = value;
         }
-    ).set_env("LLAMA_ARG_UBATCH"));
+    ).set_env("LLAMA_ARG_UBATCH").set_context());
     add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
@@ -1580,7 +1590,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.swa_full = true;
         }
-    ).set_env("LLAMA_ARG_SWA_FULL"));
+    ).set_env("LLAMA_ARG_SWA_FULL").set_context());
     add_opt(common_arg(
         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
         string_format("max number of context checkpoints to create per slot (default: %d)"
@@ -1614,7 +1624,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.kv_unified = value;
         }
-    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
+    ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}).set_context());
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
@@ -2290,7 +2300,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.no_kv_offload = !value;
         }
-    ).set_env("LLAMA_ARG_KV_OFFLOAD"));
+    ).set_env("LLAMA_ARG_KV_OFFLOAD").set_context());
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
@@ -2318,7 +2328,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.cache_type_k = kv_cache_type_from_str(value);
         }
-    ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
+    ).set_env("LLAMA_ARG_CACHE_TYPE_K").set_context());
     add_opt(common_arg(
         {"-ctv", "--cache-type-v"}, "TYPE",
         string_format(
@@ -2331,7 +2341,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.cache_type_v = kv_cache_type_from_str(value);
         }
-    ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
+    ).set_env("LLAMA_ARG_CACHE_TYPE_V").set_context());
     add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
@@ -2454,14 +2464,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.mmproj.path = value;
         }
-    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ"));
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ").set_mmproj());
     add_opt(common_arg(
         {"-mmu", "--mmproj-url"}, "URL",
         "URL to a multimodal projector file. see tools/mtmd/README.md",
         [](common_params & params, const std::string & value) {
             params.mmproj.url = value;
         }
-    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_URL"));
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_URL").set_mmproj());
     add_opt(common_arg(
         {"--mmproj-auto"},
         {"--no-mmproj", "--no-mmproj-auto"},
@@ -2477,7 +2487,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.mmproj_use_gpu = value;
         }
-    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD"));
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_MMPROJ_OFFLOAD").set_mmproj());
     add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",
         "path to an image, audio, or video file. use with multimodal models, use comma-separated values for multiple files\n",
@@ -2493,21 +2503,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.image_min_tokens = value;
         }
-    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MIN_TOKENS"));
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MIN_TOKENS").set_mmproj());
     add_opt(common_arg(
         {"--image-max-tokens"}, "N",
         "maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)",
         [](common_params & params, int value) {
             params.image_max_tokens = value;
         }
-    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
+    ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS").set_mmproj());
     add_opt(common_arg(
         {"--mtmd-batch-max-tokens"}, "N",
         string_format("maximum number of image tokens per batch when encoding images (default: %d)", params.mtmd_batch_max_tokens),
         [](common_params & params, int value) {
             params.mtmd_batch_max_tokens = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTMD_BATCH_MAX_TOKENS"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTMD_BATCH_MAX_TOKENS").set_mmproj());
     if (llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",
@@ -2799,7 +2809,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.no_op_offload = !value;
         }
-    ));
+    ).set_context());
     add_opt(common_arg(
         {"--lora"}, "FNAME",
         "path to LoRA adapter (use comma-separated values to load multiple adapters)",

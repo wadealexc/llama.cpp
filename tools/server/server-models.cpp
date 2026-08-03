@@ -2,6 +2,7 @@
 #include "http.h"
 #include "server-models.h"
 #include "server-context.h"
+#include "server-schema.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -129,6 +130,52 @@ static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
         preset.unset_option("LLAMA_ARG_ALIAS");
         preset.unset_option("LLAMA_ARG_HF_REPO");
     }
+}
+
+// reconfiguration delta buckets derived from common_arg flags
+struct reconfig_delta {
+    bool context     = false;
+    bool mmproj      = false;
+    bool spec        = false;
+    bool weight_arch = false;
+    bool empty() const { return !context && !mmproj && !spec && !weight_arch; }
+};
+
+// strip reserved injected args (HOST/PORT/ALIAS/TAGS) and return the option map. these are
+// injected by update_args or are informational, so they are not real config deltas
+static std::map<common_arg, std::string> preset_options_for_compare(common_preset p) {
+    p.unset_option("LLAMA_ARG_HOST");
+    p.unset_option("LLAMA_ARG_PORT");
+    p.unset_option("LLAMA_ARG_ALIAS");
+    p.unset_option("LLAMA_ARG_TAGS");
+    return p.options;
+}
+
+// classify the delta between two effective presets into actuator buckets. iterates the union of
+// options; any value difference (including presence-only) routes the option's common_arg flags
+// into the matching bucket. untagged options fall into weight_arch
+static reconfig_delta classify_reconfig_delta(const common_preset & current, const common_preset & target) {
+    auto cur = preset_options_for_compare(current);
+    auto tgt = preset_options_for_compare(target);
+    reconfig_delta delta;
+    auto classify = [&delta](const common_arg & opt) {
+        if (opt.is_context)       { delta.context     = true; }
+        else if (opt.is_mmproj)  { delta.mmproj      = true; }
+        else if (opt.is_spec)    { delta.spec        = true; }
+        else                      { delta.weight_arch = true; }
+    };
+    for (const auto & [opt, val] : cur) {
+        auto it = tgt.find(opt);
+        if (it == tgt.end() || it->second != val) {
+            classify(opt);
+        }
+    }
+    for (const auto & [opt, val] : tgt) {
+        if (cur.find(opt) == cur.end()) {
+            classify(opt);
+        }
+    }
+    return delta;
 }
 
 #ifdef _WIN32
@@ -405,12 +452,7 @@ void server_models::load_models() {
         }
     };
     // update_args() injects HOST/PORT/ALIAS, so strip them before comparing presets
-    auto preset_options_for_compare = [](common_preset p) {
-        p.unset_option("LLAMA_ARG_HOST");
-        p.unset_option("LLAMA_ARG_PORT");
-        p.unset_option("LLAMA_ARG_ALIAS");
-        return p.options;
-    };
+    // (preset_options_for_compare is the file-local helper that also strips TAGS)
 
     // Phase 2: acquire the lock once for all mapping mutations.
     // We temporarily release it only when calling functions that acquire it internally
@@ -422,11 +464,13 @@ void server_models::load_models() {
     bool is_first_load = mapping.empty();
 
     if (is_first_load) {
-        // FIRST LOAD: add all models, then unlock for autoloading
+        // FIRST LOAD: add base models, then attach their variants, then unlock for autoloading
         for (const auto & [name, preset] : final_presets) {
+            if (!preset.is_base_model()) continue;
             server_model_meta meta{
                 /* source        */ get_source(name),
                 /* preset        */ preset,
+                /* base_preset   */ preset,
                 /* name          */ name,
                 /* aliases       */ {},
                 /* tags          */ {},
@@ -439,9 +483,16 @@ void server_models::load_models() {
                 /* exit_code     */ 0,
                 /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
                 /* multimodal    */ mtmd_caps{false, false},
-                // /* need_download */ false,
             };
             add_model(std::move(meta));
+        }
+        // attach variants to their bases
+        for (const auto & [name, preset] : final_presets) {
+            if (preset.is_base_model()) continue;
+            auto it = mapping.find(preset.base);
+            if (it != mapping.end()) {
+                it->second.meta.variants.push_back(preset);
+            }
         }
         apply_stop_timeout();
         log_available_models();
@@ -475,8 +526,12 @@ void server_models::load_models() {
             auto it = final_presets.find(name);
             if (it == final_presets.end()) {
                 to_unload.push_back(name); // removed from source
-            } else if (preset_options_for_compare(inst.meta.preset) != preset_options_for_compare(it->second)) {
-                to_unload.push_back(name); // preset changed
+            } else if (classify_reconfig_delta(inst.meta.preset, it->second).weight_arch) {
+                // invariant: runtime fields (context/mmproj/spec) are owned by the running model
+                // and must not be reverted by a background reload; only weight/arch-class drift
+                // triggers revert. a runtime-only delta (e.g. a running variant whose effective
+                // options differ from the base section on disk) is intentionally left alone
+                to_unload.push_back(name); // weight/arch-class preset changed
             }
         }
 
@@ -551,8 +606,18 @@ void server_models::load_models() {
             if (inst.meta.is_running()) continue;
             auto it = final_presets.find(name);
             if (it == final_presets.end()) continue; // erased above
+            if (!it->second.is_base_model()) continue; // variants are attached below
 
-            inst.meta.preset = it->second;
+            inst.meta.preset     = it->second;
+            inst.meta.base_preset = it->second; // base's own disk preset; same as preset at rest
+
+            // refresh variants from disk
+            inst.meta.variants.clear();
+            for (const auto & [vname, vpreset] : final_presets) {
+                if (vpreset.base == name) {
+                    inst.meta.variants.push_back(vpreset);
+                }
+            }
 
             // re-parse aliases, then validate against other models
             std::set<std::string> new_aliases;
@@ -596,27 +661,33 @@ void server_models::load_models() {
         // add models that are new in this reload
         std::vector<std::string> newly_added;
         for (const auto & [name, preset] : final_presets) {
-            if (mapping.find(name) == mapping.end()) {
-                server_model_meta meta{
-                    /* source        */ get_source(name),
-                    /* preset        */ preset,
-                    /* name          */ name,
-                    /* aliases       */ {},
-                    /* tags          */ {},
-                    /* port          */ 0,
-                    /* status        */ SERVER_MODEL_STATUS_UNLOADED,
-                    /* last_used     */ 0,
-                    /* args          */ std::vector<std::string>(),
-                    /* loaded_info   */ {},
-                    /* progress      */ {},
-                    /* exit_code     */ 0,
-                    /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
-                    /* multimodal    */ mtmd_caps{false, false},
-                    // /* need_download */ false,
-                };
-                add_model(std::move(meta));
-                newly_added.push_back(name);
+            if (!preset.is_base_model()) continue; // variants are attached to their base
+            if (mapping.find(name) != mapping.end()) continue;
+            server_model_meta meta{
+                /* source        */ get_source(name),
+                /* preset        */ preset,
+                /* base_preset   */ preset,
+                /* name          */ name,
+                /* aliases       */ {},
+                /* tags          */ {},
+                /* port          */ 0,
+                /* status        */ SERVER_MODEL_STATUS_UNLOADED,
+                /* last_used     */ 0,
+                /* args          */ std::vector<std::string>(),
+                /* loaded_info   */ {},
+                /* progress      */ {},
+                /* exit_code     */ 0,
+                /* stop_timeout  */ DEFAULT_STOP_TIMEOUT,
+                /* multimodal    */ mtmd_caps{false, false},
+            };
+            // attach variants
+            for (const auto & [vname, vpreset] : final_presets) {
+                if (vpreset.base == name) {
+                    meta.variants.push_back(vpreset);
+                }
             }
+            add_model(std::move(meta));
+            newly_added.push_back(name);
         }
 
         apply_stop_timeout();
@@ -659,17 +730,27 @@ void server_models::update_meta(const std::string & name, const server_model_met
     cv.notify_all(); // notify wait_until_loading_finished
 }
 
-bool server_models::has_model(const std::string & name) {
-    std::lock_guard<std::mutex> lk(mutex);
-    if (mapping.find(name) != mapping.end()) {
-        return true;
+auto server_models::find_base_locked(const std::string & name) -> std::map<std::string, instance_t>::iterator {
+    // direct base name
+    auto it = mapping.find(name);
+    if (it != mapping.end()) {
+        return it;
     }
-    for (const auto & [key, inst] : mapping) {
-        if (inst.meta.aliases.count(name)) {
-            return true;
+    // alias, or a variant name belonging to a base
+    for (it = mapping.begin(); it != mapping.end(); ++it) {
+        if (it->second.meta.aliases.count(name)) {
+            return it;
+        }
+        if (it->second.meta.find_variant(name) != nullptr) {
+            return it;
         }
     }
-    return false;
+    return mapping.end();
+}
+
+bool server_models::has_model(const std::string & name) {
+    std::lock_guard<std::mutex> lk(mutex);
+    return find_base_locked(name) != mapping.end();
 }
 
 std::optional<server_model_meta> server_models::get_meta(const std::string & name) {
@@ -680,14 +761,9 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
         lk.lock();
     }
 
-    auto it = mapping.find(name);
+    auto it = find_base_locked(name);
     if (it != mapping.end()) {
         return it->second.meta;
-    }
-    for (const auto & [key, inst] : mapping) {
-        if (inst.meta.aliases.count(name)) {
-            return inst.meta;
-        }
     }
     return std::nullopt;
 }
@@ -746,11 +822,15 @@ void server_models::load(const std::string & name) {
 }
 
 void server_models::load(const std::string & name, const load_options & opts) {
+    // downloads are exempt from LRU eviction
+    if (opts.mode != SERVER_CHILD_MODE_DOWNLOAD) {
+        unload_lru();
+    }
+
     if (!opts.custom_meta.has_value()) {
         if (!has_model(name)) {
             throw std::runtime_error("model name=" + name + " is not found");
         }
-        unload_lru();
     }
 
     std::unique_lock<std::mutex> lk(mutex);
@@ -758,10 +838,34 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // against the freshest preset and a consistent mapping state
     cv.wait(lk, [this]() { return !is_reloading; });
 
-    auto meta = opts.custom_meta.has_value() ? *opts.custom_meta : mapping[name].meta;
-    if (meta.status != SERVER_MODEL_STATUS_UNLOADED) {
+    // resolve to the base entry that will host the process. `name` may be a base name,
+    // an alias, or a variant name; find_base_locked handles all three
+    auto base_it = opts.custom_meta.has_value() ? mapping.end() : find_base_locked(name);
+    if (!opts.custom_meta.has_value() && base_it == mapping.end()) {
+        throw std::runtime_error("model name=" + name + " is not found");
+    }
+
+    // the process lives on the base entry
+    std::string inst_name = opts.custom_meta.has_value() ? name : base_it->first;
+    if (base_it != mapping.end() && base_it->second.meta.status != SERVER_MODEL_STATUS_UNLOADED) {
         SRV_INF("model %s is not ready\n", name.c_str());
         return;
+    }
+
+    // build the meta for the spawned process: carry the base's identity (name/aliases/tags/source/variants)
+    // and apply the variant's preset when loading a variant by name
+    server_model_meta meta = opts.custom_meta.has_value() ? *opts.custom_meta : base_it->second.meta;
+    if (!opts.custom_meta.has_value() && name != inst_name) {
+        // name is a variant — use its effective preset and record it as active
+        const common_preset * variant = base_it->second.meta.find_variant(name);
+        if (variant) {
+            // apply the variant's effective preset; base_preset is left untouched (the base's
+            // own disk config) so a later switch-back can diff against it without a cold-load
+            meta.preset = *variant;
+            meta.running_as = name;
+        }
+    } else if (!opts.custom_meta.has_value()) {
+        meta.running_as.clear();
     }
 
     // Re-check capacity under the lock to prevent concurrent loads from
@@ -825,7 +929,7 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // start a thread to manage the child process
     // captured variables are guaranteed to be destroyed only after the thread is joined
     inst.th = std::thread([
-        this, name,
+        this, name = inst_name,
         child_proc = inst.subproc,
         port = inst.meta.port,
         stop_timeout = inst.meta.stop_timeout,
@@ -922,10 +1026,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
 
     // clean up old process/thread if exists
     {
-        auto & old_instance = mapping[name];
+        auto & old_instance = mapping[inst_name];
         // old process should have exited already, but just in case, we clean it up here
         if (old_instance.subproc && old_instance.subproc->is_alive()) {
-            SRV_WRN("old process for model name=%s is still alive, this is unexpected\n", name.c_str());
+            SRV_WRN("old process for model name=%s is still alive, this is unexpected\n", inst_name.c_str());
             old_instance.subproc->terminate(); // force kill
         }
         if (old_instance.th.joinable()) {
@@ -937,7 +1041,10 @@ void server_models::load(const std::string & name, const load_options & opts) {
         {"status", server_model_status_to_string(inst.meta.status)},
     });
 
-    mapping[name] = std::move(inst);
+    // place the process on the base entry. the spawned instance carries the base's identity
+    // (name/aliases/tags/source/variants) with the effective preset applied above
+    mapping[inst_name] = std::move(inst);
+
     cv.notify_all();
 }
 
@@ -1005,6 +1112,10 @@ void server_models::update_status(const std::string & name, const update_status_
         }
         if (!args.progress.is_null()) {
             meta.progress = args.progress;
+        }
+        // when the process stops, clear the active-variant pointer
+        if (args.status == SERVER_MODEL_STATUS_UNLOADED) {
+            meta.running_as.clear();
         }
     }
     // broadcast status change to SSE
@@ -1470,7 +1581,7 @@ static bool router_validate_model(std::string & name, server_models & models, bo
         res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
         return false;
     }
-    // resolve alias to canonical model name
+    // resolve alias / variant name to the canonical base name (the mapping key)
     name = meta->name;
     if (!models_autoload && !meta->is_running()) {
         res_err(res, format_error_response("model is not loaded", ERROR_TYPE_INVALID_REQUEST));
@@ -1611,11 +1722,99 @@ void server_models_routes::init_routes() {
             res_err(res, format_error_response("model is not found", ERROR_TYPE_NOT_FOUND));
             return res;
         }
+        // get_meta resolves to the base entry where the process lives
         if (meta->is_running()) {
-            res_err(res, format_error_response("model is already running", ERROR_TYPE_INVALID_REQUEST));
+            // reconciler: reconfigure the running subprocess in place via reload_* instead of
+            // cold-reloading. resolve the target effective preset: the named variant's, or the
+            // base's own disk preset (base_preset) when switching back from a variant
+            const common_preset * variant = meta->find_variant(name);
+            common_preset target;
+            std::string target_running_as;
+            if (variant) {
+                target            = *variant;
+                target_running_as = name;
+            } else {
+                target            = meta->base_preset;
+                target_running_as.clear();
+            }
+            SRV_INF("reconcile: base='%s' current_variant='%s' target='%s'\n",
+                    meta->name.c_str(), meta->running_as.c_str(), target_running_as.c_str());
+            reconfig_delta delta = classify_reconfig_delta(meta->preset, target);
+            SRV_INF("reconcile: delta ctx=%d mmproj=%d spec=%d weight_arch=%d\n",
+                    delta.context, delta.mmproj, delta.spec, delta.weight_arch);
+            if (delta.weight_arch) {
+                // weight/arch-class delta has no in-place actuator; caller must unload first
+                res_err(res, format_error_response(
+                    "model is already running with a different configuration; cold-load required, unload first",
+                    ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            if (delta.empty()) {
+                // already running the requested config
+                res_ok(res, {{"success", true}});
+                return res;
+            }
+            // emit one reload_* call per runtime bucket present in the delta. each is proxied to
+            // the child via POST /reload?target=<bucket>; the body carries the target's relevant
+            // params plus the base name so the router's proxy_post can route it to the child
+            common_params target_params;
+            SRV_INF("reconcile: applying target preset to params\n", 0);
+            target.apply_to_params(target_params);
+            SRV_INF("reconcile: done apply_to_params\n", 0);
+            const std::string & base_name = meta->name;
+            auto reload_bucket = [&](const std::string & bucket, const json & bucket_body) -> bool {
+                SRV_INF("reconcile: building %s reload request\n", bucket.c_str());
+                json send_body = bucket_body;
+                send_body["model"] = base_name;
+                std::function<bool()> stop_fn = []() { return false; };
+                server_http_req r{
+                    /* params       */ {},
+                    /* headers      */ {},
+                    /* path         */ "/reload",
+                    /* query_string */ "target=" + bucket,
+                    /* body         */ send_body.dump(),
+                    /* files        */ {},
+                    /* should_stop  */ stop_fn,
+                };
+                SRV_INF("reconcile: calling proxy_request for %s\n", bucket.c_str());
+                // detached: the reload must reach the child even if this client socket drops
+                auto pres = models.proxy_request(r, "POST", base_name, false, true);
+                SRV_INF("reconcile: proxy_request returned status=%d for %s\n",
+                        pres ? pres->status : -1, bucket.c_str());
+                return pres && pres->status >= 200 && pres->status < 300;
+            };
+            bool ok = true;
+            if (delta.context) {
+                ok = ok && reload_bucket("context", server_schema::serialize_ctx_params(target_params));
+            }
+            if (ok && delta.mmproj) {
+                ok = ok && reload_bucket("mmproj", server_schema::serialize_mmproj_params(target_params));
+            }
+            if (ok && delta.spec) {
+                ok = ok && reload_bucket("speculative", server_schema::serialize_spec_params(target_params));
+            }
+            if (!ok) {
+                // kill-on-failure: no partial rollback. unload lets the monitoring thread move
+                // the base to UNLOADED with exit_code set; running_as is cleared by update_status
+                models.unload(base_name);
+                res_err(res, format_error_response(
+                    "reconfiguration failed; model has been unloaded", ERROR_TYPE_SERVER));
+                return res;
+            }
+            // success: adopt the target effective preset and active-variant pointer
+            {
+                std::lock_guard<std::mutex> lk(models.mutex);
+                auto it = models.mapping.find(base_name);
+                if (it != models.mapping.end()) {
+                    it->second.meta.preset     = target;
+                    it->second.meta.running_as = target_running_as;
+                }
+            }
+            res_ok(res, {{"success", true}});
             return res;
         }
-        models.load(meta->name);
+        // cold-load: spawn on the base with the requested preset (variant's effective or base's own)
+        models.load(name);
         res_ok(res, {{"success", true}});
         return res;
     };
@@ -1642,6 +1841,15 @@ void server_models_routes::init_routes() {
                 preset_copy.unset_option("LLAMA_ARG_ALIAS");
                 preset_copy.unset_option("LLAMA_ARG_TAGS");
                 status["preset"] = preset_copy.to_ini();
+            }
+            // expose the active variant and the available variant names on a base entry
+            status["variant"] = meta.running_as;
+            if (!meta.variants.empty()) {
+                json variants_json = json::array();
+                for (const auto & v : meta.variants) {
+                    variants_json.push_back(v.name);
+                }
+                status["variants"] = variants_json;
             }
             if (meta.is_failed()) {
                 status["exit_code"] = meta.exit_code;

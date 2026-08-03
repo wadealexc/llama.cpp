@@ -82,6 +82,9 @@ std::string common_preset::to_ini() const {
     std::ostringstream ss;
 
     ss << "[" << name << "]\n";
+    if (!base.empty()) {
+        ss << "base = " << base << "\n";
+    }
     for (const auto & [opt, value] : options) {
         auto espaced_value = value;
         string_replace_all(espaced_value, "\n", "\\\n");
@@ -308,6 +311,12 @@ common_presets common_preset_context::load_from_ini(const std::string & path, co
             }
 
             LOG_DBG("option: %s = %s\n", key.c_str(), value.c_str());
+            if (key == "base") {
+                // reserved key: names the parent section this preset inherits from
+                preset.base = value;
+                continue;
+            }
+
             if (filter_allowed_keys && allowed_keys.find(key) == allowed_keys.end()) {
                 throw std::runtime_error(string_format(
                     "option '%s' is not allowed in remote presets",
@@ -340,6 +349,36 @@ common_presets common_preset_context::load_from_ini(const std::string & path, co
         } else {
             out[preset.name] = preset;
         }
+    }
+
+    // validate base preset references and cascade base settings to child
+    for (auto & [name, preset] : out) {
+        if (preset.is_base_model()) {
+            continue;
+        }
+        auto it = out.find(preset.base);
+        if (it == out.end()) {
+            throw std::runtime_error(string_format(
+                "preset '%s' references unknown base '%s'",
+                name.c_str(), preset.base.c_str()));
+        }
+        if (!it->second.is_base_model()) {
+            throw std::runtime_error(string_format(
+                "preset '%s' inherits from '%s', which itself inherits from '%s'",
+                name.c_str(), preset.base.c_str(), it->second.base.c_str()));
+        }
+
+        // strip the base's alias/tags before cascade, then overlay the variant on top
+        // of the base (variant's options win). preserve the variant's name/base fields.
+        const std::string variant_name = preset.name;
+        const std::string variant_base = preset.base;
+        common_preset base = it->second; // copy
+        base.unset_option("LLAMA_ARG_ALIAS");
+        base.unset_option("LLAMA_ARG_TAGS");
+        base.merge(preset);
+        preset           = std::move(base);
+        preset.name      = variant_name;
+        preset.base      = variant_base;
     }
 
     return out;
@@ -462,8 +501,10 @@ common_presets common_preset_context::cascade(const common_preset & base, const 
     for (const auto & [name, preset] : presets) {
         common_preset tmp = base; // copy
         tmp.name = name;
+        tmp.base = preset.base;
         tmp.merge(preset);
         out[name] = std::move(tmp);
     }
     return out;
 }
+
