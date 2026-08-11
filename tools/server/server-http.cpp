@@ -35,6 +35,7 @@ static void log_server_request(const httplib::Request & req, const httplib::Resp
         || req.path == "/v1/models"
         || req.path == "/props"
         || req.path == "/metrics"
+        || req.path == "/memory"
     ) {
         return;
     }
@@ -198,6 +199,7 @@ bool server_http_context::init(const common_params & params) {
         std::unordered_set<std::string> endpoints {
             "/health",
             "/v1/health",
+            "/memory",
         };
         endpoints.insert(frontend_paths.begin(), frontend_paths.end());
         return endpoints;

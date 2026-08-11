@@ -2665,3 +2665,22 @@ std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const char * mmproj_f
         return {};
     }
 }
+
+std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const mtmd_context * ctx) {
+    std::map<ggml_backend_dev_t, size_t> total_mem;
+    if (ctx == nullptr) {
+        return total_mem;
+    }
+    auto merge = [&](const struct clip_ctx * c) {
+        for (auto & [dev, size] : clip_get_mem_usage(c)) {
+            total_mem[dev] += size;
+        }
+    };
+    if (ctx->ctx_v) {
+        merge(ctx->ctx_v);
+    }
+    if (ctx->ctx_a) {
+        merge(ctx->ctx_a);
+    }
+    return total_mem;
+}

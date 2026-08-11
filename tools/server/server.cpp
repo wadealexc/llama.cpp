@@ -220,6 +220,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
         routes.get_slots                   = models_routes->proxy_get;
         routes.post_slots                  = models_routes->proxy_post;
         routes.post_reload                 = models_routes->proxy_post;
+        routes.get_memory                  = models_routes->proxy_get;
 
         // custom routes for router
         routes.get_props                   = models_routes->get_router_props;
@@ -275,6 +276,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
     // Runtime reconfiguration
     ctx_http.post("/reload",                   ex_wrapper(routes.post_reload));
+    ctx_http.get ("/memory",                   ex_wrapper(routes.get_memory));
 
     // resumable streaming: a child binds the local session factories, the router binds
     // proxies that resolve the owning child, see server-stream.h

@@ -1686,6 +1686,32 @@ json server_task_result_apply_lora::to_json() {
 }
 
 //
+// server_task_result_memory
+//
+
+json server_task_result_memory::to_json() {
+    json devices_json = json::array();
+    for (const auto & d : devs) {
+        json comps = json::object();
+        for (const auto & [name, c] : d.components) {
+            comps[name] = {
+                {"model",   c.model},
+                {"context", c.context},
+                {"compute", c.compute},
+            };
+        }
+        devices_json.push_back({
+            {"name",       d.name},
+            {"type",       d.type},
+            {"total",      d.total},
+            {"free",       d.free},
+            {"components", std::move(comps)},
+        });
+    }
+    return json { { "devices", std::move(devices_json) } };
+}
+
+//
 // server_prompt_cache
 //
 size_t server_prompt_cache::size() const {

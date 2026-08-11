@@ -2398,6 +2398,119 @@ private:
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
     }
 
+    std::vector<server_device_memory_data> get_memory_breakdown() {
+        const size_t nd = model_tgt ? llama_model_n_devices(model_tgt) : 0;
+        const size_t CPU_INDEX = nd;
+
+        std::vector<ggml_backend_dev_t> devs;
+        devs.reserve(nd);
+        for (size_t i = 0; i < nd; i++) {
+            devs.push_back(llama_model_get_device(model_tgt, i));
+        }
+
+        std::vector<server_device_memory_data> ret(nd + 1);
+
+        auto add_component = [&](const std::string & name) {
+            for (auto & d : ret) {
+                d.components[name];
+            }
+        };
+
+        // accumulate a memory breakdown into each device
+        auto accumulate = [&](const llama_memory_breakdown & breakdown, const std::string & name) {
+            for (const auto & [buft, mb] : breakdown) {
+                if (ggml_backend_buft_is_host(buft)) {
+                    ret.back().components[name].model   += mb.model;
+                    ret.back().components[name].context += mb.context;
+                    ret.back().components[name].compute += mb.compute;
+                    continue;
+                }
+
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                if (!dev) {
+                    continue;
+                }
+                for (size_t i = 0; i < nd; i++) {
+                    if (dev == devs[i]) {
+                        ret[i].components[name].model   += mb.model;
+                        ret[i].components[name].context += mb.context;
+                        ret[i].components[name].compute += mb.compute;
+                        break;
+                    }
+                }
+            }
+        };
+
+        if (ctx_tgt) {
+            add_component("main");
+            accumulate(llama_get_memory_breakdown(ctx_tgt), "main");
+        }
+
+        if (ctx_dft) {
+            add_component("spec");
+            accumulate(llama_get_memory_breakdown(ctx_dft), "spec");
+        }
+
+        if (mctx) {
+            add_component("mmproj");
+            auto mmproj_mem = mtmd_get_memory_usage(mctx);
+            for (const auto & [dev, size] : mmproj_mem) {
+                size_t dev_idx = CPU_INDEX;
+                for (size_t i = 0; i < nd; i++) {
+                    if (dev == devs[i]) {
+                        dev_idx = i;
+                        break;
+                    }
+                }
+                ret[dev_idx].components["mmproj"].model += size;
+            }
+        }
+
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        size_t cpu_free = 0;
+        size_t cpu_total = 0;
+        if (cpu_dev) {
+            ggml_backend_dev_memory(cpu_dev, &cpu_free, &cpu_total);
+        }
+        ret[CPU_INDEX].name  = "CPU";
+        ret[CPU_INDEX].type  = "cpu";
+        ret[CPU_INDEX].total = cpu_total;
+        ret[CPU_INDEX].free  = cpu_free;
+
+        auto type_str = [](ggml_backend_dev_t dev) -> std::string {
+            switch (ggml_backend_dev_type(dev)) {
+                case GGML_BACKEND_DEVICE_TYPE_GPU:  return "gpu";
+                case GGML_BACKEND_DEVICE_TYPE_IGPU: return "igpu";
+                case GGML_BACKEND_DEVICE_TYPE_ACCEL:return "accel";
+                case GGML_BACKEND_DEVICE_TYPE_CPU:
+                case GGML_BACKEND_DEVICE_TYPE_META:
+                default:                            return "cpu";
+            }
+        };
+
+        for (size_t i = 0; i < nd; i++) {
+            ggml_backend_dev_t dev = devs[i];
+            ret[i].name = ggml_backend_dev_name(dev);
+            ret[i].type = type_str(dev);
+            size_t free;
+            size_t total;
+            ggml_backend_dev_memory(dev, &free, &total);
+            // some non-GPU accelerator backends (e.g. BLAS) report 0/0 and rely on the
+            // host-memory fallback; GPU-like backends keep 0/0 so the gap is visible
+            if (free == 0 && total == 0) {
+                const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+                if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                    free  = cpu_free;
+                    total = cpu_total;
+                }
+            }
+            ret[i].total = total;
+            ret[i].free  = free;
+        }
+
+        return ret;
+    }
+
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
         // while yielding, an encode / decode is running and only reading the server state is safe
@@ -2779,6 +2892,13 @@ private:
                     }
 
                     res->success = true;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_MEMORY:
+                {
+                    auto res = std::make_unique<server_task_result_memory>();
+                    res->id      = task.id;
+                    res->devs = get_memory_breakdown();
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -5359,6 +5479,31 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_reload*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    this->get_memory = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_MEMORY);
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task), true); // high-priority task
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_memory*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
     };
