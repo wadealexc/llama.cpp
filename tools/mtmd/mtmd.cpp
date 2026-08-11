@@ -4073,3 +4073,25 @@ int64_t mtmd_audio_stream_get_n_rows(const mtmd_audio_stream * s) {
 int64_t mtmd_audio_stream_get_n_rows_flushed(const mtmd_audio_stream * s) {
     return s->n_rows_flushed;
 }
+
+std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const mtmd_context * ctx) {
+    std::map<ggml_backend_dev_t, size_t> total_mem;
+    if (ctx == nullptr) {
+        return total_mem;
+    }
+    auto merge = [&](const struct clip_ctx * c) {
+        for (auto & [dev, size] : clip_get_mem_usage(c)) {
+            total_mem[dev] += size;
+        }
+    };
+    if (ctx->ctx_v) {
+        merge(ctx->ctx_v);
+    }
+    if (ctx->ctx_a) {
+        merge(ctx->ctx_a);
+    }
+    if (ctx->ctx_gen_a) {
+        merge(ctx->ctx_gen_a);
+    }
+    return total_mem;
+}

@@ -563,6 +563,9 @@ struct mtmd_memory_usage {
 MTMD_API struct mtmd_memory_usage mtmd_get_memory_usage(
     const char * mmproj_fname,
     struct mtmd_context_params ctx_params);
+
+// Get memory usage of an existing mtmd_context in bytes, per backend device
+MTMD_API std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(const mtmd_context * ctx);
 #endif
 
 //
