@@ -2417,10 +2417,10 @@ private:
         };
 
         // accumulate a memory breakdown into each device
-        auto accumulate = [&](const llama_memory_breakdown & breakdown, const std::string & name) {
+        auto accumulate = [&](const llama_memory_breakdown & breakdown, const std::string & name, bool include_model) {
             for (const auto & [buft, mb] : breakdown) {
                 if (ggml_backend_buft_is_host(buft)) {
-                    ret.back().components[name].model   += mb.model;
+                    ret.back().components[name].model   += include_model ? mb.model : 0;
                     ret.back().components[name].context += mb.context;
                     ret.back().components[name].compute += mb.compute;
                     continue;
@@ -2432,7 +2432,7 @@ private:
                 }
                 for (size_t i = 0; i < nd; i++) {
                     if (dev == devs[i]) {
-                        ret[i].components[name].model   += mb.model;
+                        ret[i].components[name].model   += include_model ? mb.model : 0;
                         ret[i].components[name].context += mb.context;
                         ret[i].components[name].compute += mb.compute;
                         break;
@@ -2443,12 +2443,12 @@ private:
 
         if (ctx_tgt) {
             add_component("main");
-            accumulate(llama_get_memory_breakdown(ctx_tgt), "main");
+            accumulate(llama_get_memory_breakdown(ctx_tgt), "main", true);
         }
 
         if (ctx_dft) {
             add_component("spec");
-            accumulate(llama_get_memory_breakdown(ctx_dft), "spec");
+            accumulate(llama_get_memory_breakdown(ctx_dft), "spec", model_dft != nullptr);
         }
 
         if (mctx) {
