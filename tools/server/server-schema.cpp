@@ -765,14 +765,22 @@ std::vector<std::unique_ptr<field>> make_llama_spec_schema(common_params_specula
 
 std::vector<std::unique_ptr<field>> make_llama_reload_schema(common_params & params) {
     std::vector<std::unique_ptr<field>> fields;
-    auto append = [&](std::vector<std::unique_ptr<field>> & src) {
-        for (auto & f : src) {
-            fields.push_back(std::move(f));
-        }
-    };
-    auto ctx_fields    = make_llama_ctx_schema(params);            append(ctx_fields);
-    auto mmproj_fields = make_llama_mmproj_schema(params);         append(mmproj_fields);
-    auto spec_fields   = make_llama_spec_schema(params.speculative); append(spec_fields);
+
+    auto ctx_fields = make_llama_ctx_schema(params);
+    for (auto & f : ctx_fields) {
+        fields.push_back(std::move(f));
+    }
+
+    auto mmproj_fields = make_llama_mmproj_schema(params);
+    auto mmproj_nested = std::make_unique<field_nested>("mmproj");
+    mmproj_nested->subfields = std::move(mmproj_fields);
+    fields.push_back(std::move(mmproj_nested));
+
+    auto spec_fields = make_llama_spec_schema(params.speculative);
+    auto spec_nested = std::make_unique<field_nested>("spec");
+    spec_nested->subfields = std::move(spec_fields);
+    fields.push_back(std::move(spec_nested));
+
     return fields;
 }
 
