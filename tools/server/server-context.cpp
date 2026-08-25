@@ -1343,7 +1343,9 @@ private:
 
         // Persist new params
         params_base = params;
-        params_base.n_outputs_max = server_n_outputs_max(params_base);
+        const auto output_limits = server_output_limits(params_base);
+        params_base.n_outputs_max = output_limits.total;
+        params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         std::string & mmproj_path = params_base.mmproj.path;
         const bool has_mmproj = !mmproj_path.empty();
