@@ -1563,6 +1563,7 @@ llama_context * common_init_result::reinit_context(common_params & params) {
     pimpl->samplers.clear();
     pimpl->samplers_seq_config.clear();
     pimpl->context.reset();
+    pimpl->threadpools.reset();
 
     llama_context * lctx = init_context_inner(params);
     if (lctx == NULL) {
@@ -1830,6 +1831,19 @@ common_threadpools::~common_threadpools() {
     }
     free_fn(threadpool);
     free_fn(threadpool_batch);
+}
+
+void common_threadpools::reset() {
+    if (!free_fn) {
+        return;
+    }
+
+    free_fn(threadpool);
+    free_fn(threadpool_batch);
+
+    threadpool       = nullptr;
+    threadpool_batch = nullptr;
+    free_fn = nullptr;
 }
 
 void common_threadpools::init(llama_context * ctx, const common_params & params) {

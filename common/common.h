@@ -961,6 +961,7 @@ struct common_threadpools {
     common_threadpools & operator=(const common_threadpools &) = delete;
 
     void init(llama_context * ctx, const common_params & params);
+    void reset();
 
 private:
     ggml_threadpool * threadpool       = nullptr;
