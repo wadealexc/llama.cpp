@@ -37,6 +37,9 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+constexpr uint32_t SLOT_CKPT_SIDECAR_MAGIC   = 0x434b5054;
+constexpr uint32_t SLOT_CKPT_SIDECAR_VERSION = 1;
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -2721,6 +2724,42 @@ private:
                         break;
                     }
 
+                    if (!slot->prompt.checkpoints.empty()) {
+                        const std::string ckpt_path = filepath + ".ckpt";
+                        std::ofstream ckpt_file(ckpt_path, std::ios::binary);
+                        if (ckpt_file) {
+                            auto write_u32  = [&](uint32_t v) { ckpt_file.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
+                            auto write_i32  = [&](int32_t  v) { ckpt_file.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
+                            auto write_i64  = [&](int64_t  v) { ckpt_file.write(reinterpret_cast<const char *>(&v), sizeof(v)); };
+                            auto write_blob = [&](const std::vector<uint8_t> & b) {
+                                const uint64_t sz = b.size();
+                                ckpt_file.write(reinterpret_cast<const char *>(&sz), sizeof(sz));
+                                if (sz > 0) {
+                                    ckpt_file.write(reinterpret_cast<const char *>(b.data()), sz);
+                                }
+                            };
+                            write_u32(SLOT_CKPT_SIDECAR_MAGIC);
+                            write_u32(SLOT_CKPT_SIDECAR_VERSION);
+                            write_u32((uint32_t) slot->prompt.checkpoints.size());
+                            for (const auto & ckpt : slot->prompt.checkpoints) {
+                                write_i64(ckpt.n_tokens);
+                                write_i32(ckpt.id_task);
+                                write_i32(ckpt.pos_min);
+                                write_i32(ckpt.pos_max);
+                                write_blob(ckpt.data_tgt);
+                                write_blob(ckpt.data_dft);
+                                write_blob(ckpt.data_spec);
+                            }
+                            if (ckpt_file) {
+                                SLT_TRC(*slot, "saved %d context checkpoint(s) to sidecar %s\n", (int) slot->prompt.checkpoints.size(), ckpt_path.c_str());
+                            } else {
+                                SRV_WRN("failed to write checkpoint sidecar: %s\n", ckpt_path.c_str());
+                            }
+                        } else {
+                            SRV_WRN("failed to open checkpoint sidecar for writing: %s\n", ckpt_path.c_str());
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2780,6 +2819,59 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        {
+                            const std::string ckpt_path = filepath + ".ckpt";
+                            std::ifstream ckpt_file(ckpt_path, std::ios::binary);
+                            if (ckpt_file) {
+                                ckpt_file.seekg(0, std::ios::end);
+                                const uint64_t ckpt_bytes = (uint64_t) ckpt_file.tellg();
+                                ckpt_file.seekg(0, std::ios::beg);
+
+                                auto read_u32  = [&]() { uint32_t v = 0; ckpt_file.read(reinterpret_cast<char *>(&v), sizeof(v)); return v; };
+                                auto read_i32  = [&]() { int32_t  v = 0; ckpt_file.read(reinterpret_cast<char *>(&v), sizeof(v)); return v; };
+                                auto read_i64  = [&]() { int64_t  v = 0; ckpt_file.read(reinterpret_cast<char *>(&v), sizeof(v)); return v; };
+                                auto read_blob = [&]() {
+                                    std::vector<uint8_t> b;
+                                    uint64_t sz = 0;
+                                    ckpt_file.read(reinterpret_cast<char *>(&sz), sizeof(sz));
+                                    if (sz > ckpt_bytes) {
+                                        ckpt_file.setstate(std::ios::failbit);
+                                        return b;
+                                    }
+                                    b.resize(sz);
+                                    if (sz > 0) {
+                                        ckpt_file.read(reinterpret_cast<char *>(b.data()), sz);
+                                    }
+                                    return b;
+                                };
+
+                                const uint32_t magic   = read_u32();
+                                const uint32_t version = read_u32();
+                                if (!ckpt_file || magic != SLOT_CKPT_SIDECAR_MAGIC || version != SLOT_CKPT_SIDECAR_VERSION) {
+                                    SRV_WRN("ignoring incompatible checkpoint sidecar: %s\n", ckpt_path.c_str());
+                                } else {
+                                    const uint32_t n_ckpt = read_u32();
+                                    for (uint32_t i = 0; i < n_ckpt && ckpt_file; ++i) {
+                                        common_prompt_checkpoint ckpt;
+                                        ckpt.n_tokens  = read_i64();
+                                        ckpt.id_task   = read_i32();
+                                        ckpt.pos_min   = read_i32();
+                                        ckpt.pos_max   = read_i32();
+                                        ckpt.data_tgt  = read_blob();
+                                        ckpt.data_dft  = read_blob();
+                                        ckpt.data_spec = read_blob();
+                                        slot->prompt.checkpoints.push_back(std::move(ckpt));
+                                    }
+                                    if (!ckpt_file) {
+                                        SRV_WRN("discarding truncated/corrupt checkpoint sidecar: %s\n", ckpt_path.c_str());
+                                        slot->prompt.checkpoints.clear();
+                                    } else {
+                                        SLT_TRC(*slot, "restored %d context checkpoint(s) from sidecar %s\n", (int) slot->prompt.checkpoints.size(), ckpt_path.c_str());
+                                    }
+                                }
+                            }
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);

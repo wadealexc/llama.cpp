@@ -223,6 +223,56 @@ def test_slot_save_restore_text_only_on_multimodal(mmproj_server):
     assert res.status_code == 200
 
 
+def test_slot_save_restore_swa_prefix_reuse(mmproj_server):
+    server = mmproj_server
+    # disable the prompt cache so it doesn't mask missing checkpoints
+    server.cache_ram = 0
+    server.start()
+
+    prompt = "The quick brown fox jumps over the lazy dog."
+
+    # A pure-text prompt processed on slot 1.
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 1,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    prompt_n_full = res.body["timings"]["prompt_n"]
+    assert res.body["timings"]["cache_n"] == 0
+    assert prompt_n_full > 0
+
+    # Save the slot
+    res = server.make_request("POST", "/slots/1?action=save", data={
+        "filename": "swa_slot.bin",
+    })
+    assert res.status_code == 200
+    n_saved = res.body["n_saved"]
+    assert n_saved > 0
+
+    # Erase every slot
+    for i in range(2):
+        res = server.make_request("POST", f"/slots/{i}?action=erase")
+        assert res.status_code == 200
+
+    # Restore the saved state into slot 0; it must round-trip exactly.
+    res = server.make_request("POST", "/slots/0?action=restore", data={
+        "filename": "swa_slot.bin",
+    })
+    assert res.status_code == 200
+    assert res.body["n_restored"] == n_saved
+
+    # Expect prefix reuse with identical prompt
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": 0,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 0
+    assert res.body["timings"]["prompt_n"] < prompt_n_full
+
+
 def test_slot_save_restore_with_image(mmproj_server):
     server = mmproj_server
     # Use the full SWA cache so the restored image prefix can be reused.
