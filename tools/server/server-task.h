@@ -571,10 +571,11 @@ struct server_task_result_apply_lora : server_task_result {
 
 struct server_task_result_reload : server_task_result {
     bool        success = false;
+    int32_t     n_ctx   = 0;
     std::string message; // optional detail when success is false
 
     virtual json to_json() override {
-        json out = json { { "success", success } };
+        json out = json { { "success", success }, { "n_ctx", n_ctx } };
         if (!message.empty()) {
             out["message"] = message;
         }

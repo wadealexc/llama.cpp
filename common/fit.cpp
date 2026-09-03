@@ -902,6 +902,51 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
+uint32_t common_fit_ctx_from_avail(
+        const size_t * needed_max,
+        const size_t * needed_min,
+        const size_t * avail,
+        size_t nd,
+        uint32_t n_ctx_max,
+        uint32_t n_ctx_min,
+        uint32_t n_streams) {
+    uint32_t n_ctx_fit = n_ctx_max;
+
+    if (nd == 0) {
+        if (avail[0] >= needed_max[0]) {
+            n_ctx_fit = n_ctx_max;
+        } else if (avail[0] <= needed_min[0]) {
+            n_ctx_fit = n_ctx_min;
+        } else {
+            uint64_t num = (uint64_t)(avail[0] - needed_min[0]) * (n_ctx_max - n_ctx_min);
+            uint64_t den = needed_max[0] - needed_min[0];
+            n_ctx_fit = n_ctx_min + (uint32_t)(num / den);
+        }
+    } else {
+        for (size_t i = 0; i < nd; i++) {
+            uint32_t n_ctx_dev;
+            if (avail[i] >= needed_max[i]) {
+                n_ctx_dev = n_ctx_max;
+            } else if (avail[i] <= needed_min[i]) {
+                n_ctx_dev = n_ctx_min;
+            } else {
+                uint64_t num = (uint64_t)(avail[i] - needed_min[i]) * (n_ctx_max - n_ctx_min);
+                uint64_t den = needed_max[i] - needed_min[i];
+                n_ctx_dev = n_ctx_min + (uint32_t)(num / den);
+            }
+
+            n_ctx_dev = n_ctx_dev - (n_ctx_dev % (256 * n_streams));
+            if (n_ctx_dev < n_ctx_fit) {
+                n_ctx_fit = n_ctx_dev;
+            }
+        }
+    }
+
+    n_ctx_fit = n_ctx_fit - (n_ctx_fit % (256 * n_streams));
+
+    return n_ctx_fit;
+}
+
 void common_memory_breakdown_print(const struct llama_context * ctx) {
     //const auto & devices = ctx->get_model().devices;
     const auto * model = llama_get_model(ctx);

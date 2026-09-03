@@ -1377,6 +1377,182 @@ private:
         SRV_INF("reloading model '%s'\n", params.model.get_name().c_str());
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
 
+        if (params.n_ctx == 0) {
+            const size_t nd = model_tgt ? llama_model_n_devices(model_tgt) : 0;
+
+            auto mem_breakdown = get_memory_breakdown();
+
+            std::vector<size_t> ctx_tgt_bytes(nd + 1, 0);
+            std::vector<size_t> dft_bytes(nd + 1, 0);
+            std::vector<size_t> mmproj_bytes(nd + 1, 0);
+            std::vector<size_t> free_bytes(nd + 1, 0);
+
+            for (size_t i = 0; i < nd + 1; i++) {
+                const auto & d = mem_breakdown[i];
+                free_bytes[i] = d.free;
+                auto it_main = d.components.find("main");
+                if (it_main != d.components.end()) {
+                    ctx_tgt_bytes[i] = it_main->second.context + it_main->second.compute;
+                }
+                auto it_spec = d.components.find("spec");
+                if (it_spec != d.components.end()) {
+                    dft_bytes[i] = it_spec->second.model + it_spec->second.context + it_spec->second.compute;
+                }
+                auto it_mmproj = d.components.find("mmproj");
+                if (it_mmproj != d.components.end()) {
+                    mmproj_bytes[i] = it_mmproj->second.model;
+                }
+            }
+
+            std::vector<ggml_backend_dev_t> devs;
+            if (nd > 0) {
+                devs.reserve(nd);
+                for (size_t i = 0; i < nd; i++) {
+                    devs.push_back(llama_model_get_device(model_tgt, i));
+                }
+            }
+
+            const uint32_t n_ctx_train  = llama_model_n_ctx_train(model_tgt);
+            const uint32_t n_streams    = params_base.kv_unified ? 1 : std::max<uint32_t>(1, params_base.n_parallel);
+            const uint32_t n_ctx_max    = (uint32_t) std::min<uint64_t>((uint64_t) n_ctx_train * n_streams, UINT32_MAX);
+            const uint32_t n_ctx_min_fit = 1024;
+
+            auto mparams_main = common_model_params_to_llama(params_base);
+
+            auto cparams_max = common_context_params_to_llama(params_base);
+            cparams_max.n_ctx = n_ctx_max;
+
+            auto cparams_min = common_context_params_to_llama(params_base);
+            cparams_min.n_ctx = n_ctx_min_fit;
+
+            std::vector<ggml_backend_dev_t> devs_tmp;
+            uint32_t hp_ngl = 0;
+            uint32_t hp_nct = 0;
+            uint32_t hp_nex = 0;
+
+            auto dmds_max = common_get_device_memory_data(
+                params_base.model.path.c_str(), &mparams_main, &cparams_max,
+                devs_tmp, hp_ngl, hp_nct, hp_nex,
+                GGML_LOG_LEVEL_ERROR);
+
+            auto dmds_min = common_get_device_memory_data(
+                params_base.model.path.c_str(), &mparams_main, &cparams_min,
+                devs_tmp, hp_ngl, hp_nct, hp_nex,
+                GGML_LOG_LEVEL_ERROR);
+
+            std::vector<size_t> needed_max(nd + 1, 0);
+            std::vector<size_t> needed_min(nd + 1, 0);
+
+            for (size_t i = 0; i < dmds_max.size(); i++) {
+                needed_max[i] += dmds_max[i].context + dmds_max[i].compute;
+                needed_min[i] += dmds_min[i].context + dmds_min[i].compute;
+            }
+
+            if (has_spec) {
+                common_params params_dft = common_base_params_to_speculative(params_base);
+                auto mparams_dft = common_model_params_to_llama(params_dft);
+
+                auto cparams_dft_max = common_context_params_to_llama(params_dft);
+                cparams_dft_max.n_ctx = n_ctx_max;
+
+                auto cparams_dft_min = common_context_params_to_llama(params_dft);
+                cparams_dft_min.n_ctx = n_ctx_min_fit;
+                if (spec_mtp) {
+                    cparams_dft_max.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                    cparams_dft_max.n_rs_seq = 0;
+
+                    cparams_dft_min.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                    cparams_dft_min.n_rs_seq = 0;
+                }
+
+                std::vector<ggml_backend_dev_t> devs_dft_max;
+                uint32_t dft_ngl = 0;
+                uint32_t dft_nct = 0;
+                uint32_t dft_nex = 0;
+
+                auto dft_dmds_max = common_get_device_memory_data(
+                    params_dft.model.path.c_str(), &mparams_dft, &cparams_dft_max,
+                    devs_dft_max, dft_ngl, dft_nct, dft_nex,
+                    GGML_LOG_LEVEL_ERROR);
+
+                std::vector<ggml_backend_dev_t> devs_dft_min;
+                uint32_t dft_ngl2 = 0;
+                uint32_t dft_nct2 = 0;
+                uint32_t dft_nex2 = 0;
+
+                auto dft_dmds_min = common_get_device_memory_data(
+                    params_dft.model.path.c_str(), &mparams_dft, &cparams_dft_min,
+                    devs_dft_min, dft_ngl2, dft_nct2, dft_nex2,
+                    GGML_LOG_LEVEL_ERROR);
+
+                auto merge_dft_dmds = [&](const common_device_memory_data_vec & dft_dmds, const std::vector<ggml_backend_dev_t> & dft_devs, std::vector<size_t> & needed) {
+                    for (size_t j = 0; j + 1 < dft_dmds.size(); j++) {
+                        GGML_ASSERT(j < dft_devs.size());
+                        size_t matched = nd;
+                        for (size_t i = 0; i < nd; i++) {
+                            if (dft_devs[j] == devs[i]) {
+                                matched = i;
+                                break;
+                            }
+                        }
+                        size_t extra = has_draft
+                            ? dft_dmds[j].model + dft_dmds[j].context + dft_dmds[j].compute
+                            : dft_dmds[j].context + dft_dmds[j].compute;
+                        needed[matched] += extra;
+                    }
+                    {
+                        size_t extra = has_draft
+                            ? dft_dmds.back().model + dft_dmds.back().context + dft_dmds.back().compute
+                            : dft_dmds.back().context + dft_dmds.back().compute;
+                        needed.back() += extra;
+                    }
+                };
+
+                merge_dft_dmds(dft_dmds_max, devs_dft_max, needed_max);
+                merge_dft_dmds(dft_dmds_min, devs_dft_min, needed_min);
+            }
+
+            if (has_mmproj) {
+                mtmd_context_params mparams_mm = build_mtmd_context_params(params_base);
+                auto mmproj_new = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_mm);
+                for (const auto & [dev, size] : mmproj_new) {
+                    size_t dev_idx = nd;
+                    for (size_t i = 0; i < nd; i++) {
+                        if (dev == devs[i]) {
+                            dev_idx = i;
+                            break;
+                        }
+                    }
+                    needed_max[dev_idx] += size;
+                    needed_min[dev_idx] += size;
+                }
+            }
+
+            std::vector<size_t> avail_vec(nd + 1, 0);
+            for (size_t i = 0; i < nd + 1; i++) {
+                size_t freed = ctx_tgt_bytes[i] + dft_bytes[i] + mmproj_bytes[i];
+                size_t margin = i < nd && i < params_base.fit_params_target.size()
+                    ? params_base.fit_params_target[i] : 0;
+                avail_vec[i] = (free_bytes[i] + freed > margin)
+                    ? free_bytes[i] + freed - margin : 0;
+            }
+
+            uint32_t n_ctx_fit = common_fit_ctx_from_avail(
+                needed_max.data(), needed_min.data(), avail_vec.data(),
+                nd, n_ctx_max, n_ctx_min_fit, n_streams);
+
+            if (n_ctx_fit < n_ctx_min_fit) {
+                SRV_ERR("reload fit: calculated n_ctx = %d is less than minimum %d, model cannot fit\n",
+                    n_ctx_fit, n_ctx_min_fit);
+                return false;
+            }
+
+            params.n_ctx = n_ctx_fit;
+            params_base.n_ctx = n_ctx_fit;
+
+            SRV_INF("reload fit: n_ctx set to %d\n", n_ctx_fit);
+        }
+
         // TODO: validate new runtime is compatible with device/memory reqs before reset
         {
             reset_runtime_state();
@@ -2986,6 +3162,7 @@ private:
                     }
 
                     res->success = true;
+                    res->n_ctx   = n_ctx;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_MEMORY:

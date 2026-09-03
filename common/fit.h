@@ -65,3 +65,12 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
+
+uint32_t common_fit_ctx_from_avail(
+        const size_t * needed_max,
+        const size_t * needed_min,
+        const size_t * avail,
+        size_t nd,
+        uint32_t n_ctx_max,
+        uint32_t n_ctx_min,
+        uint32_t n_streams);
