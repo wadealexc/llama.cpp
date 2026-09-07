@@ -37,6 +37,19 @@ common_params_fit_status common_fit_params(
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
+// fits context size for a model reload. assumes weights are already loaded
+common_params_fit_status common_fit_for_reload(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+       const common_fit_extra_model * extra,
+                           uint32_t   n_ctx_max,
+                           uint32_t   n_ctx_min,
+                           uint32_t   n_streams,
+                             size_t * avail,
+                           uint32_t * n_ctx_fit,
+                     ggml_log_level   log_level);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,
@@ -65,12 +78,3 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
                      ggml_log_level   log_level);
-
-uint32_t common_fit_ctx_from_avail(
-        const size_t * needed_max,
-        const size_t * needed_min,
-        const size_t * avail,
-        size_t nd,
-        uint32_t n_ctx_max,
-        uint32_t n_ctx_min,
-        uint32_t n_streams);

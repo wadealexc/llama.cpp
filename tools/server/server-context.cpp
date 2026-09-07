@@ -1417,99 +1417,13 @@ private:
             const uint32_t n_ctx_max    = (uint32_t) std::min<uint64_t>((uint64_t) n_ctx_train * n_streams, UINT32_MAX);
             const uint32_t n_ctx_min_fit = 1024;
 
-            auto mparams_main = common_model_params_to_llama(params_base);
-
-            auto cparams_max = common_context_params_to_llama(params_base);
-            cparams_max.n_ctx = n_ctx_max;
-
-            auto cparams_min = common_context_params_to_llama(params_base);
-            cparams_min.n_ctx = n_ctx_min_fit;
-
-            std::vector<ggml_backend_dev_t> devs_tmp;
-            uint32_t hp_ngl = 0;
-            uint32_t hp_nct = 0;
-            uint32_t hp_nex = 0;
-
-            auto dmds_max = common_get_device_memory_data(
-                params_base.model.path.c_str(), &mparams_main, &cparams_max,
-                devs_tmp, hp_ngl, hp_nct, hp_nex,
-                GGML_LOG_LEVEL_ERROR);
-
-            auto dmds_min = common_get_device_memory_data(
-                params_base.model.path.c_str(), &mparams_main, &cparams_min,
-                devs_tmp, hp_ngl, hp_nct, hp_nex,
-                GGML_LOG_LEVEL_ERROR);
-
-            std::vector<size_t> needed_max(nd + 1, 0);
-            std::vector<size_t> needed_min(nd + 1, 0);
-
-            for (size_t i = 0; i < dmds_max.size(); i++) {
-                needed_max[i] += dmds_max[i].context + dmds_max[i].compute;
-                needed_min[i] += dmds_min[i].context + dmds_min[i].compute;
-            }
-
-            if (has_spec) {
-                common_params params_dft = common_base_params_to_speculative(params_base);
-                auto mparams_dft = common_model_params_to_llama(params_dft);
-
-                auto cparams_dft_max = common_context_params_to_llama(params_dft);
-                cparams_dft_max.n_ctx = n_ctx_max;
-
-                auto cparams_dft_min = common_context_params_to_llama(params_dft);
-                cparams_dft_min.n_ctx = n_ctx_min_fit;
-                if (spec_mtp) {
-                    cparams_dft_max.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-                    cparams_dft_max.n_rs_seq = 0;
-
-                    cparams_dft_min.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-                    cparams_dft_min.n_rs_seq = 0;
-                }
-
-                std::vector<ggml_backend_dev_t> devs_dft_max;
-                uint32_t dft_ngl = 0;
-                uint32_t dft_nct = 0;
-                uint32_t dft_nex = 0;
-
-                auto dft_dmds_max = common_get_device_memory_data(
-                    params_dft.model.path.c_str(), &mparams_dft, &cparams_dft_max,
-                    devs_dft_max, dft_ngl, dft_nct, dft_nex,
-                    GGML_LOG_LEVEL_ERROR);
-
-                std::vector<ggml_backend_dev_t> devs_dft_min;
-                uint32_t dft_ngl2 = 0;
-                uint32_t dft_nct2 = 0;
-                uint32_t dft_nex2 = 0;
-
-                auto dft_dmds_min = common_get_device_memory_data(
-                    params_dft.model.path.c_str(), &mparams_dft, &cparams_dft_min,
-                    devs_dft_min, dft_ngl2, dft_nct2, dft_nex2,
-                    GGML_LOG_LEVEL_ERROR);
-
-                auto merge_dft_dmds = [&](const common_device_memory_data_vec & dft_dmds, const std::vector<ggml_backend_dev_t> & dft_devs, std::vector<size_t> & needed) {
-                    for (size_t j = 0; j + 1 < dft_dmds.size(); j++) {
-                        GGML_ASSERT(j < dft_devs.size());
-                        size_t matched = nd;
-                        for (size_t i = 0; i < nd; i++) {
-                            if (dft_devs[j] == devs[i]) {
-                                matched = i;
-                                break;
-                            }
-                        }
-                        size_t extra = has_draft
-                            ? dft_dmds[j].model + dft_dmds[j].context + dft_dmds[j].compute
-                            : dft_dmds[j].context + dft_dmds[j].compute;
-                        needed[matched] += extra;
-                    }
-                    {
-                        size_t extra = has_draft
-                            ? dft_dmds.back().model + dft_dmds.back().context + dft_dmds.back().compute
-                            : dft_dmds.back().context + dft_dmds.back().compute;
-                        needed.back() += extra;
-                    }
-                };
-
-                merge_dft_dmds(dft_dmds_max, devs_dft_max, needed_max);
-                merge_dft_dmds(dft_dmds_min, devs_dft_min, needed_min);
+            std::vector<size_t> avail_vec(nd + 1, 0);
+            for (size_t i = 0; i < nd + 1; i++) {
+                size_t freed = ctx_tgt_bytes[i] + dft_bytes[i] + mmproj_bytes[i];
+                size_t margin = i < nd && i < params_base.fit_params_target.size()
+                    ? params_base.fit_params_target[i] : 0;
+                avail_vec[i] = (free_bytes[i] + freed > margin)
+                    ? free_bytes[i] + freed - margin : 0;
             }
 
             if (has_mmproj) {
@@ -1523,25 +1437,39 @@ private:
                             break;
                         }
                     }
-                    needed_max[dev_idx] += size;
-                    needed_min[dev_idx] += size;
+                    avail_vec[dev_idx] = avail_vec[dev_idx] > size
+                        ? avail_vec[dev_idx] - size : 0;
                 }
             }
 
-            std::vector<size_t> avail_vec(nd + 1, 0);
-            for (size_t i = 0; i < nd + 1; i++) {
-                size_t freed = ctx_tgt_bytes[i] + dft_bytes[i] + mmproj_bytes[i];
-                size_t margin = i < nd && i < params_base.fit_params_target.size()
-                    ? params_base.fit_params_target[i] : 0;
-                avail_vec[i] = (free_bytes[i] + freed > margin)
-                    ? free_bytes[i] + freed - margin : 0;
+            auto mparams_main = common_model_params_to_llama(params_base);
+            auto cparams_main = common_context_params_to_llama(params_base);
+
+            common_params params_dft = common_base_params_to_speculative(params_base);
+            auto mparams_dft = common_model_params_to_llama(params_dft);
+            auto cparams_dft = common_context_params_to_llama(params_dft);
+            if (spec_mtp) {
+                cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                cparams_dft.n_rs_seq = 0;
             }
 
-            uint32_t n_ctx_fit = common_fit_ctx_from_avail(
-                needed_max.data(), needed_min.data(), avail_vec.data(),
-                nd, n_ctx_max, n_ctx_min_fit, n_streams);
+            const common_fit_extra_model extra = {
+                params_dft.model.path.c_str(),
+                &mparams_dft,
+                &cparams_dft,
+                !has_draft,
+            };
 
-            if (n_ctx_fit < n_ctx_min_fit) {
+            uint32_t n_ctx_fit = 0;
+
+            const auto status = common_fit_for_reload(
+                    params_base.model.path.c_str(), &mparams_main, &cparams_main,
+                    has_spec ? &extra : nullptr,
+                    n_ctx_max, n_ctx_min_fit, n_streams,
+                    avail_vec.data(), &n_ctx_fit,
+                    params_base.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || n_ctx_fit < n_ctx_min_fit) {
                 SRV_ERR("reload fit: calculated n_ctx = %d is less than minimum %d, model cannot fit\n",
                     n_ctx_fit, n_ctx_min_fit);
                 return false;

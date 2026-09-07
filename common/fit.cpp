@@ -902,6 +902,67 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
+static std::vector<size_t> common_fit_reload_needed(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const common_fit_extra_model * extra,
+        uint32_t n_ctx,
+        ggml_log_level log_level) {
+    llama_context_params cparams_ctx = *cparams;
+    cparams_ctx.n_ctx = n_ctx;
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+
+    auto dmds = common_get_device_memory_data(
+        path_model, mparams, &cparams_ctx,
+        devs, hp_ngl, hp_nct, hp_nex,
+        log_level);
+
+    const size_t nd = dmds.size() - 1;
+
+    std::vector<size_t> needed(dmds.size(), 0);
+    for (size_t i = 0; i < dmds.size(); i++) {
+        needed[i] += dmds[i].context + dmds[i].compute;
+    }
+
+    if (extra) {
+        llama_context_params cparams_extra = *extra->cparams;
+        cparams_extra.n_ctx = n_ctx;
+
+        std::vector<ggml_backend_dev_t> devs_extra;
+        uint32_t extra_ngl = 0;
+        uint32_t extra_nct = 0;
+        uint32_t extra_nex = 0;
+
+        auto dmds_extra = common_get_device_memory_data(
+            extra->path_model, extra->mparams, &cparams_extra,
+            devs_extra, extra_ngl, extra_nct, extra_nex,
+            log_level);
+
+        for (size_t j = 0; j + 1 < dmds_extra.size(); j++) {
+            size_t matched = nd;
+            for (size_t i = 0; i < nd; i++) {
+                if (devs_extra[j] == devs[i]) {
+                    matched = i;
+                    break;
+                }
+            }
+            needed[matched] += extra->shares_model
+                ? dmds_extra[j].context + dmds_extra[j].compute
+                : dmds_extra[j].model + dmds_extra[j].context + dmds_extra[j].compute;
+        }
+        needed[nd] += extra->shares_model
+            ? dmds_extra.back().context + dmds_extra.back().compute
+            : dmds_extra.back().model + dmds_extra.back().context + dmds_extra.back().compute;
+    }
+
+    return needed;
+}
+
 uint32_t common_fit_ctx_from_avail(
         const size_t * needed_max,
         const size_t * needed_min,
@@ -945,6 +1006,42 @@ uint32_t common_fit_ctx_from_avail(
     n_ctx_fit = n_ctx_fit - (n_ctx_fit % (256 * n_streams));
 
     return n_ctx_fit;
+}
+
+common_params_fit_status common_fit_for_reload(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        const common_fit_extra_model * extra,
+        uint32_t n_ctx_max,
+        uint32_t n_ctx_min,
+        uint32_t n_streams,
+        size_t * avail,
+        uint32_t * n_ctx_fit,
+        ggml_log_level log_level) {
+    const int64_t t0_us = llama_time_us();
+    common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+    try {
+        auto needed_max = common_fit_reload_needed(path_model, mparams, cparams, extra, n_ctx_max, log_level);
+        auto needed_min = common_fit_reload_needed(path_model, mparams, cparams, extra, n_ctx_min, log_level);
+
+        const uint32_t n_ctx = common_fit_ctx_from_avail(
+                needed_max.data(), needed_min.data(), avail,
+                needed_max.size() - 1, n_ctx_max, n_ctx_min, n_streams);
+
+        if (n_ctx < n_ctx_min) {
+            LOG_WRN("%s: calculated n_ctx = %" PRIu32 " is less than minimum %" PRIu32 "\n", __func__, n_ctx, n_ctx_min);
+            status = COMMON_PARAMS_FIT_STATUS_FAILURE;
+        } else {
+            *n_ctx_fit = n_ctx;
+        }
+    } catch (const std::runtime_error & e) {
+        LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
+        status = COMMON_PARAMS_FIT_STATUS_ERROR;
+    }
+    const int64_t t1_us = llama_time_us();
+    LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
+    return status;
 }
 
 void common_memory_breakdown_print(const struct llama_context * ctx) {
