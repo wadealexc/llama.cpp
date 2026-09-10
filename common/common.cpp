@@ -1324,6 +1324,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        // persist resolved n_ctx
+        params.n_ctx = cparams.n_ctx;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
