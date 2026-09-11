@@ -1568,6 +1568,50 @@ llama_context * common_init_result::reinit_context(common_params & params) {
     pimpl->context.reset();
     pimpl->threadpools.reset();
 
+    auto mparams = common_model_params_to_llama(params);
+    auto cparams = common_context_params_to_llama(params);
+
+    if (params.n_ctx == 0) {
+        COM_TRC("%s", "[reinit] fitting params to device memory ...\n");
+
+        // the draft context is created from the same base params and follows the main context, fit both together
+        const bool has_draft = params.speculative.has_dft();
+        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        const bool has_spec = has_draft || spec_mtp;
+
+        common_params params_dft = common_base_params_to_speculative(params);
+
+        auto mparams_dft = common_model_params_to_llama(params_dft);
+        auto cparams_dft = common_context_params_to_llama(params_dft);
+        if (spec_mtp) {
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        }
+        cparams_dft.n_rs_seq = 0;
+
+        const common_fit_extra_model extra = {
+            /*.path_model   =*/ params_dft.model.path.c_str(),
+            /*.mparams      =*/ &mparams_dft,
+            /*.cparams      =*/ &cparams_dft,
+            /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+        };
+
+        const auto status = common_fit_for_reload(params.model.path.c_str(), model, &mparams, &cparams,
+            params.fit_params_target.data(),
+            params.fit_params_min_ctx,
+            has_spec ? &extra : nullptr,
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            COM_ERR("[reinit] failed to fit n_ctx to memory for model '%s'", params.model.path.c_str());
+            return NULL;
+        }
+
+        // persist resolved n_ctx
+        COM_TRC("[reinit] n_ctx set to %d", cparams.n_ctx);
+        params.n_ctx = cparams.n_ctx;
+    }
+
     llama_context * lctx = init_context_inner(params);
     if (lctx == NULL) {
         COM_ERR("%s", "failed to reinitialize context\n");

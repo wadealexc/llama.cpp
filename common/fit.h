@@ -40,14 +40,12 @@ common_params_fit_status common_fit_params(
 // fits context size for a model reload. assumes weights are already loaded
 common_params_fit_status common_fit_for_reload(
                          const char * path_model,
+                  const llama_model * model,
            const llama_model_params * mparams,
-         const llama_context_params * cparams,
-       const common_fit_extra_model * extra,
-                           uint32_t   n_ctx_max,
+               llama_context_params * cparams,
+                             size_t * margins,
                            uint32_t   n_ctx_min,
-                           uint32_t   n_streams,
-                             size_t * avail,
-                           uint32_t * n_ctx_fit,
+       const common_fit_extra_model * extra,
                      ggml_log_level   log_level);
 
 // print estimated memory to stdout

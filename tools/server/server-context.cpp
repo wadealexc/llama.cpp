@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "ggml-backend.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -16,6 +17,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "src/llama-ext.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -861,6 +863,8 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    std::vector<size_t> fit_params_target_original;
+
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
@@ -1183,6 +1187,13 @@ private:
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
+        // cache original fit_params_target before we modify it
+        if (fit_params_target_original.empty()) {
+            fit_params_target_original = params_base.fit_params_target;
+        } else {
+            params_base.fit_params_target = fit_params_target_original;
+        }
+
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
@@ -1349,6 +1360,8 @@ private:
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
+        // restore original fit target
+        params_base.fit_params_target = fit_params_target_original;
 
         std::string & mmproj_path = params_base.mmproj.path;
         const bool has_mmproj = !mmproj_path.empty();
@@ -1377,117 +1390,49 @@ private:
         SRV_INF("reloading model '%s'\n", params.model.get_name().c_str());
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
 
-        if (params.n_ctx == 0) {
-            const size_t nd = model_tgt ? llama_model_n_devices(model_tgt) : 0;
-
-            auto mem_breakdown = get_memory_breakdown();
-
-            std::vector<size_t> ctx_tgt_bytes(nd + 1, 0);
-            std::vector<size_t> dft_bytes(nd + 1, 0);
-            std::vector<size_t> mmproj_bytes(nd + 1, 0);
-            std::vector<size_t> free_bytes(nd + 1, 0);
-
-            for (size_t i = 0; i < nd + 1; i++) {
-                const auto & d = mem_breakdown[i];
-                free_bytes[i] = d.free;
-                auto it_main = d.components.find("main");
-                if (it_main != d.components.end()) {
-                    ctx_tgt_bytes[i] = it_main->second.context + it_main->second.compute;
-                }
-                auto it_spec = d.components.find("spec");
-                if (it_spec != d.components.end()) {
-                    dft_bytes[i] = it_spec->second.model + it_spec->second.context + it_spec->second.compute;
-                }
-                auto it_mmproj = d.components.find("mmproj");
-                if (it_mmproj != d.components.end()) {
-                    mmproj_bytes[i] = it_mmproj->second.model;
-                }
-            }
-
-            std::vector<ggml_backend_dev_t> devs;
-            if (nd > 0) {
-                devs.reserve(nd);
-                for (size_t i = 0; i < nd; i++) {
-                    devs.push_back(llama_model_get_device(model_tgt, i));
-                }
-            }
-
-            const uint32_t n_ctx_train  = llama_model_n_ctx_train(model_tgt);
-            const uint32_t n_streams    = params_base.kv_unified ? 1 : std::max<uint32_t>(1, params_base.n_parallel);
-            const uint32_t n_ctx_max    = (uint32_t) std::min<uint64_t>((uint64_t) n_ctx_train * n_streams, UINT32_MAX);
-            const uint32_t n_ctx_min_fit = 1024;
-
-            std::vector<size_t> avail_vec(nd + 1, 0);
-            for (size_t i = 0; i < nd + 1; i++) {
-                size_t freed = ctx_tgt_bytes[i] + dft_bytes[i] + mmproj_bytes[i];
-                size_t margin = i < nd && i < params_base.fit_params_target.size()
-                    ? params_base.fit_params_target[i] : 0;
-                avail_vec[i] = (free_bytes[i] + freed > margin)
-                    ? free_bytes[i] + freed - margin : 0;
-            }
-
-            if (has_mmproj) {
-                mtmd_context_params mparams_mm = build_mtmd_context_params(params_base);
-                auto mmproj_new = mtmd_get_memory_usage(mmproj_path.c_str(), mparams_mm);
-                for (const auto & [dev, size] : mmproj_new) {
-                    size_t dev_idx = nd;
-                    for (size_t i = 0; i < nd; i++) {
-                        if (dev == devs[i]) {
-                            dev_idx = i;
-                            break;
-                        }
-                    }
-                    avail_vec[dev_idx] = avail_vec[dev_idx] > size
-                        ? avail_vec[dev_idx] - size : 0;
-                }
-            }
-
-            auto mparams_main = common_model_params_to_llama(params_base);
-            auto cparams_main = common_context_params_to_llama(params_base);
-
-            common_params params_dft = common_base_params_to_speculative(params_base);
-            auto mparams_dft = common_model_params_to_llama(params_dft);
-            auto cparams_dft = common_context_params_to_llama(params_dft);
-            if (spec_mtp) {
-                cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
-                cparams_dft.n_rs_seq = 0;
-            }
-
-            const common_fit_extra_model extra = {
-                params_dft.model.path.c_str(),
-                &mparams_dft,
-                &cparams_dft,
-                !has_draft,
-            };
-
-            uint32_t n_ctx_fit = 0;
-
-            const auto status = common_fit_for_reload(
-                    params_base.model.path.c_str(), &mparams_main, &cparams_main,
-                    has_spec ? &extra : nullptr,
-                    n_ctx_max, n_ctx_min_fit, n_streams,
-                    avail_vec.data(), &n_ctx_fit,
-                    params_base.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-
-            if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS || n_ctx_fit < n_ctx_min_fit) {
-                SRV_ERR("reload fit: calculated n_ctx = %d is less than minimum %d, model cannot fit\n",
-                    n_ctx_fit, n_ctx_min_fit);
-                return false;
-            }
-
-            params.n_ctx = n_ctx_fit;
-            params_base.n_ctx = n_ctx_fit;
-
-            SRV_INF("reload fit: n_ctx set to %d\n", n_ctx_fit);
-        }
-
-        // TODO: validate new runtime is compatible with device/memory reqs before reset
         {
             reset_runtime_state();
             params_base.speculative.draft.ctx_dft = nullptr;
             params_base.speculative.draft.ctx_tgt = nullptr;
 
             SRV_INF("%s: reset current model runtime\n", __func__);
+        }
+
+        mtmd_context_params mparams = build_mtmd_context_params(params_base);
+        // progress callback
+        mparams.progress_callback           = load_progress_callback;
+        mparams.progress_callback_user_data = &load_progress_mmproj;
+
+        // calculate margins for fit
+        if (params.n_ctx == 0) {
+            GGML_ASSERT(!params_base.fit_params_target.empty());
+
+            // optionally get memory usage of mmproj
+            if (has_mmproj) {
+                int64_t t_start = ggml_time_us();
+                auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
+                int64_t t_elapsed = ggml_time_us() - t_start;
+                if (!mmproj_mem.empty()) {
+                    size_t total = 0;
+                    for (auto & [dev, size] : mmproj_mem) {
+                        total += size;
+                    }
+                    SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
+                    for (auto & [dev, size] : mmproj_mem) {
+                        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                            if (ggml_backend_dev_get(i) == dev) {
+                                if (i < params_base.fit_params_target.size()) {
+                                    SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+                                    params_base.fit_params_target[i] += size;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
+                }
+            }
         }
 
         // progress callback

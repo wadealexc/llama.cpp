@@ -1010,30 +1010,46 @@ uint32_t common_fit_ctx_from_avail(
 
 common_params_fit_status common_fit_for_reload(
         const char * path_model,
+        const llama_model * model,
         const llama_model_params * mparams,
-        const llama_context_params * cparams,
-        const common_fit_extra_model * extra,
-        uint32_t n_ctx_max,
+        llama_context_params * cparams,
+        size_t * margins,
         uint32_t n_ctx_min,
-        uint32_t n_streams,
-        size_t * avail,
-        uint32_t * n_ctx_fit,
+        const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+
+    const uint32_t n_ctx_train     = llama_model_n_ctx_train(model);
+    const uint32_t n_streams       = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
+    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>((uint64_t) n_ctx_train * n_streams, UINT32_MAX);
+    const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>((uint64_t) n_ctx_min * n_streams, UINT32_MAX);
+
+    const size_t nd = llama_model_n_devices(model);
+    std::vector<size_t> avail(nd + 1, SIZE_MAX);
+    for (size_t i = 0; i < nd; i++) {
+        size_t dev_free;
+        size_t dev_total;
+        ggml_backend_dev_memory(llama_model_get_device(model, i), &dev_free, &dev_total);
+
+        avail[i] = margins[i] < dev_free ? dev_free - margins[i] : 0;
+    }
+
     try {
         auto needed_max = common_fit_reload_needed(path_model, mparams, cparams, extra, n_ctx_max, log_level);
-        auto needed_min = common_fit_reload_needed(path_model, mparams, cparams, extra, n_ctx_min, log_level);
+        auto needed_min = common_fit_reload_needed(path_model, mparams, cparams, extra, n_ctx_min_total, log_level);
+
+        GGML_ASSERT(needed_max.size() == avail.size());
 
         const uint32_t n_ctx = common_fit_ctx_from_avail(
-                needed_max.data(), needed_min.data(), avail,
-                needed_max.size() - 1, n_ctx_max, n_ctx_min, n_streams);
+                needed_max.data(), needed_min.data(), avail.data(),
+                needed_max.size() - 1, n_ctx_max, n_ctx_min_total, n_streams);
 
-        if (n_ctx < n_ctx_min) {
-            LOG_WRN("%s: calculated n_ctx = %" PRIu32 " is less than minimum %" PRIu32 "\n", __func__, n_ctx, n_ctx_min);
+        if (n_ctx < n_ctx_min_total) {
+            LOG_WRN("%s: calculated n_ctx = %" PRIu32 " is less than minimum %" PRIu32 "\n", __func__, n_ctx, n_ctx_min_total);
             status = COMMON_PARAMS_FIT_STATUS_FAILURE;
         } else {
-            *n_ctx_fit = n_ctx;
+            cparams->n_ctx = n_ctx;
         }
     } catch (const std::runtime_error & e) {
         LOG_ERR("%s: encountered an error while trying to fit params to free device memory: %s\n", __func__, e.what());
