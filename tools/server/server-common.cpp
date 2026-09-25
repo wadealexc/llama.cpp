@@ -666,6 +666,15 @@ void server_tokens::keep_first(size_t n) {
     tokens.resize(n);
 }
 
+std::vector<server_tokens::media_info> server_tokens::get_media_info() const {
+    std::vector<media_info> out;
+    out.reserve(map_idx_to_media.size());
+    for (const auto & item : map_idx_to_media) {
+        out.push_back({ item.first, mtmd_input_chunk_get_id(item.second.get()), (size_t) mtmd_input_chunk_get_n_tokens(item.second.get()) });
+    }
+    return out;
+}
+
 std::string server_tokens::detokenize(const llama_context * ctx, bool special) const {
     llama_tokens text_tokens;
     text_tokens.reserve(tokens.size());

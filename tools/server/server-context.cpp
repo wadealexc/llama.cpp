@@ -912,7 +912,6 @@ private:
 
     void reset_runtime_state() {
         slots.clear();
-        prompt_cache.reset();
 
         spec.reset();
         spec_init.reset();
@@ -1389,6 +1388,21 @@ private:
 
         SRV_INF("reloading model '%s'\n", params.model.get_name().c_str());
         SRV_TRC("local path '%s'\n", params.model.path.c_str());
+
+        {
+            if (prompt_cache) {
+                const int64_t t_start = ggml_time_us();
+
+                // push live slots to prompt cache
+                for (auto & slot : slots) {
+                    slot.prompt_save(*prompt_cache);
+                }
+
+                prompt_cache->update();
+
+                SRV_TRC("caching live slots took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+            }
+        }
 
         {
             reset_runtime_state();
@@ -5657,7 +5671,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const ser
     auto res = create_response();
     const json request_data = json::parse(req.body);
     std::string filename = request_data.at("filename");
-    if (!fs_validate_filename(filename)) {
+    if (!fs_validate_filename(filename, true)) {
         res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
@@ -5693,7 +5707,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     auto res = create_response();
     const json request_data = json::parse(req.body);
     std::string filename = request_data.at("filename");
-    if (!fs_validate_filename(filename)) {
+    if (!fs_validate_filename(filename, true)) {
         res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
@@ -5885,16 +5899,29 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
 
     // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
     size_t n_tokens;
+    json tokens = json::array();
+    json media = json::array();
     if (mctx != nullptr) {
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
-        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, true).size();
+        server_tokens st = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, true);
+        n_tokens = st.size();
+        tokens = st.get_tokens();
+        for (const auto & m : st.get_media_info()) {
+            media.push_back({{ "idx", m.idx }, { "id", m.id }, { "n_tokens", m.n_tokens }});
+        }
     } else {
-        n_tokens = tokenize_mixed(vocab, prompt, true, true).size();
+        llama_tokens toks = tokenize_mixed(vocab, prompt, true, true);
+        n_tokens = toks.size();
+        tokens = std::move(toks);
     }
 
-    json response = {{"input_tokens", static_cast<int64_t>(n_tokens)}};
+    json response = {
+        {"input_tokens", static_cast<int64_t>(n_tokens)},
+        {"tokens", std::move(tokens)},
+        {"media", std::move(media)},
+    };
     if (is_oai) {
         response["object"] = "response.input_tokens";
     }

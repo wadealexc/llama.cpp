@@ -230,6 +230,15 @@ public:
 
     size_t get_common_prefix(const server_tokens & b) const;
 
+    struct media_info {
+        size_t idx;
+        std::string id;
+        size_t n_tokens;
+    };
+
+    // dump media chunk info (start index, id, token count)
+    std::vector<media_info> get_media_info() const;
+
     // split the tokens into message spans, skipping over media chunks
     common_chat_msg_spans find_message_spans(const common_chat_msg_delimiters & delims) const;
 

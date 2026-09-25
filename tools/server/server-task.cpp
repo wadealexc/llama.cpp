@@ -1869,9 +1869,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         {
             auto & data = it_best->data.drft;
 
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
+            if (ctx_dft && !data.empty()) {
                 const size_t size = data.size();
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
