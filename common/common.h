@@ -921,6 +921,7 @@ struct common_init_result {
 
     std::vector<llama_adapter_lora_ptr> & lora();
 
+    void reset_context();
     llama_context * reinit_context(common_params & params);
 
     void finalize_and_warmup(common_params & params);

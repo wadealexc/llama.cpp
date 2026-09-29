@@ -919,6 +919,8 @@ private:
         ctx_dft   = nullptr;
         model_dft = nullptr;
 
+        llama_init->reset_context();
+
         ctx_tgt = nullptr;
 
         mtmd_free(mctx);
@@ -1431,6 +1433,7 @@ private:
                     }
                 } else {
                     SRV_ERR("%s", "[mtmd] failed to get memory usage of mmproj\n");
+                    return false;
                 }
             }
         }

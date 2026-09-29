@@ -1558,15 +1558,18 @@ void common_init_result::finalize_and_warmup(common_params & params) {
     }
 }
 
-llama_context * common_init_result::reinit_context(common_params & params) {
-    llama_model * model = pimpl->model.get();
-    GGML_ASSERT(model);
-
-    // reset samplers and context
+void common_init_result::reset_context() {
     pimpl->samplers.clear();
     pimpl->samplers_seq_config.clear();
     pimpl->context.reset();
     pimpl->threadpools.reset();
+}
+
+llama_context * common_init_result::reinit_context(common_params & params) {
+    llama_model * model = pimpl->model.get();
+    GGML_ASSERT(model);
+
+    reset_context();
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
