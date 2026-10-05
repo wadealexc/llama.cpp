@@ -527,6 +527,7 @@ struct server_task_result_slots : server_task_result {
 struct server_task_result_slot_save_load : server_task_result {
     std::string filename;
     bool is_save; // true = save, false = load
+    json prompt_metadata;
 
     size_t n_tokens;
     size_t n_bytes;

@@ -209,6 +209,7 @@ public:
 
     llama_tokens get_text_tokens() const;
 
+    json prompt_metadata() const;
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
 

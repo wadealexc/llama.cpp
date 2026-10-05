@@ -1626,6 +1626,8 @@ json server_task_result_slot_save_load::to_json() {
             { "filename",  filename },
             { "n_saved",   n_tokens },
             { "n_written", n_bytes },
+            { "tokens",    prompt_metadata.at("tokens") },
+            { "media",     prompt_metadata.at("media") },
             { "timings", {
                 { "save_ms", t_ms }
             }},

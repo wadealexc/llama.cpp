@@ -550,6 +550,18 @@ const llama_tokens & server_tokens::get_tokens() const {
     return tokens;
 }
 
+json server_tokens::prompt_metadata() const {
+    json media = json::array();
+    for (const auto & [start, chunk] : map_idx_to_media) {
+        media.push_back({
+            {"start", start},
+            {"id", mtmd_input_chunk_get_id(chunk.get())},
+            {"n_tokens", mtmd_input_chunk_get_n_tokens(chunk.get())},
+        });
+    }
+    return {{"tokens", tokens}, {"media", std::move(media)}};
+}
+
 std::vector<char> server_tokens::serialize() const {
     static_assert(sizeof(llama_token) == sizeof(uint32_t), "unexpected llama_token size");
 

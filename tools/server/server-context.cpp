@@ -2820,6 +2820,7 @@ private:
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = true;
+                    res->prompt_metadata = slot->prompt.tokens.prompt_metadata();
                     res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
@@ -5886,18 +5887,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
     json prompt = body_parsed.at("prompt");
     // SRV_DBG("prompt = %s\n", prompt.dump().c_str());
 
-    // TODO @ngxson : refactor this code block, move this to server-common and reuse it in other places
-    size_t n_tokens;
+    server_tokens rendered;
     if (mctx != nullptr) {
         if (!prompt.is_string()) {
             throw std::runtime_error("for mtmd, input prompt must be a string.");
         }
-        n_tokens = process_mtmd_prompt(mctx, prompt.get<std::string>(), files, true).size();
+        rendered = process_mtmd_prompt(mctx, prompt.get<std::string>(), files);
     } else {
-        n_tokens = tokenize_mixed(vocab, prompt, true, true).size();
+        rendered = server_tokens(tokenize_mixed(vocab, prompt, true, true), false);
     }
 
-    json response = {{"input_tokens", static_cast<int64_t>(n_tokens)}};
+    json response = is_oai ? rendered.prompt_metadata() : json::object();
+    response["input_tokens"] = static_cast<int64_t>(rendered.size());
     if (is_oai) {
         response["object"] = "response.input_tokens";
     }
