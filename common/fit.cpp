@@ -1058,8 +1058,8 @@ uint32_t common_fit_ctx_from_avail(
     if (nd == 0) {
         if (avail[0] >= needed_max[0]) {
             n_ctx_fit = n_ctx_max;
-        } else if (avail[0] <= needed_min[0]) {
-            n_ctx_fit = n_ctx_min;
+        } else if (avail[0] < needed_min[0]) {
+            n_ctx_fit = 0;
         } else {
             uint64_t num = (uint64_t)(avail[0] - needed_min[0]) * (n_ctx_max - n_ctx_min);
             uint64_t den = needed_max[0] - needed_min[0];
@@ -1070,8 +1070,8 @@ uint32_t common_fit_ctx_from_avail(
             uint32_t n_ctx_dev;
             if (avail[i] >= needed_max[i]) {
                 n_ctx_dev = n_ctx_max;
-            } else if (avail[i] <= needed_min[i]) {
-                n_ctx_dev = n_ctx_min;
+            } else if (avail[i] < needed_min[i]) {
+                n_ctx_dev = 0;
             } else {
                 uint64_t num = (uint64_t)(avail[i] - needed_min[i]) * (n_ctx_max - n_ctx_min);
                 uint64_t den = needed_max[i] - needed_min[i];
